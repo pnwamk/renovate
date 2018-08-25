@@ -329,7 +329,7 @@ doRewrite cfg loadedBinary symmap strat = do
   mBaseSymtab <- withCurrentELF getBaseSymbolTable
 
   -- Remove (and pad out) the sections whose size could change if we
-  -- modify the binary.  We'll re-add them later (see @appendSegment@).
+  -- modify the binary.  We'll re-add them later (see @appendHeaders@).
   --
   -- This modifies the underlying ELF file
   modifyCurrentELF padDynamicDataRegions
@@ -344,7 +344,7 @@ doRewrite cfg loadedBinary symmap strat = do
   -- a number of sections directly after .text (e.g., .fini, .rodata,
   -- .eh_frame_hdr, .eh_frame, and probably others), so the safest thing to do
   -- is figure out the next address after the end of the containing segment.
-  let newTextAddr = E.elfSectionAddr textSection + E.elfSectionSize textSection
+  (newTextAddr, lastTextSecId) <- withCurrentELF getNewTextAddress
   -- nextSegmentAddress <- withCurrentELF (segmentLayoutAddress (rcCodeLayoutBase cfg))
 --  traceM $ printf "Extra text section layout address is 0x%x" (fromIntegral nextSegmentAddress :: Word64)
   riSegmentVirtualAddress L..= Just (fromIntegral newTextAddr)
@@ -400,19 +400,46 @@ doRewrite cfg loadedBinary symmap strat = do
   -- Note that @appendSegment@ does a bit of work to ensure proper
   -- alignment.
   -- modifyCurrentELF (appendSegment instrumentationSeg)
+
+  -- Allocate a new section for the extra bytes of program text we have generated.
+  (newTextSecIdx, newTextSec) <- withCurrentELF (newTextSection newTextAddr instrumentedBytes)
+  -- Put the new section into the same segment as the actual text section (but
+  -- at the end of the segment, after the last section it contains so that we
+  -- don't have to move any code around relative to other code).  The start
+  -- address was pre-computed to support this layout.
+  --
+  -- NOTE: We don't update the size of the segment - that size is just advisory,
+  -- and we aren't in a great position to compute the real size (since there are
+  -- going to be some things in the segment with non-obvious sizes that can't be
+  -- computed until layout time).
+  modifyCurrentELF (appendSectionAfter lastTextSecId newTextSec)
+
+  -- FIXME: Now we need to do another traversal where we fix the alignment of
+  -- the data in the data segment.  We have to drop the alignment from 2MB down
+  -- to something more reasonable.  We should take the maximum alignment of all
+  -- of the sections in the data segment (and then ensure that our choice of
+  -- padding works for all of them).  We can then add some raw data at the
+  -- beginning of the segment containing the data section.
+  --
+  -- Later, we will have to perform a further adjustment including adding any
+  -- new static data to the beginning of the segment.
+  dataSeg <- withCurrentELF lookupDataSegment
+  modifyCurrentELF (fixDataAlignment (E.elfSegmentIndex dataSeg) instrumentedBytes)
+
   -- case mNewData of
   --   Nothing -> return ()
   --   Just newData -> do
   --     dataSegAddr <- withCurrentELF (segmentLayoutAddress (rcDataLayoutBase cfg))
   --     newDataSeg <- withCurrentELF (newDataSegment dataSegAddr newData)
   --     modifyCurrentELF (appendSegment newDataSeg)
-  baseAddr            <- withCurrentELF findBaseAddr
-  newProgramHeaderSeg <- withCurrentELF (newProgramHeaderSegment baseAddr)
-  modifyCurrentELF (appendSegment newProgramHeaderSeg)
+
+  -- baseAddr            <- withCurrentELF findBaseAddr
+  -- newProgramHeaderSeg <- withCurrentELF (newProgramHeaderSegment baseAddr)
+  -- modifyCurrentELF (appendSegment newProgramHeaderSeg)
   case mBaseSymtab of
     Just baseSymtab
       | rcUpdateSymbolTable cfg -> do
-          newSymtab <- withCurrentELF (buildNewSymbolTable (E.elfSectionIndex textSection) extraTextSecIdx layoutAddr newSyms baseSymtab)
+          newSymtab <- withCurrentELF (buildNewSymbolTable (E.elfSectionIndex textSection) newTextSecIdx layoutAddr newSyms baseSymtab)
           modifyCurrentELF (appendDataRegion (E.ElfDataSymtab newSymtab))
     _ -> return ()
   modifyCurrentELF appendHeaders
@@ -495,18 +522,54 @@ buildNewSymbolTable textSecIdx extraTextSecIdx layoutAddr newSyms baseTable elf
 -- does, find the address and size of the last section in the segment and use
 -- them to compute the start address of the new text section (which will be
 -- placed at the end of the segment).
+--
+-- Also returns the index of the last section, which is used to identify where
+-- to insert the new text section while building a new ELF file.
 getNewTextAddress :: ( w ~ MM.ArchAddrWidth arch
                      , Num (E.ElfWordType w)
                      )
                   => E.Elf w
-                  -> ElfRewriter arch (E.ElfWordType w)
+                  -> ElfRewriter arch (E.ElfWordType w, Word16)
 getNewTextAddress e =
   case findSegmentContainingLoadableSection ".text" (F.toList (e L.^. E.elfFileData)) of
     Nothing -> C.throwM (NoSectionFound ".text")
     Just seg -> do
       case findLastSection seg of
         Nothing -> C.throwM CannotAllocateTextSection
-        Just lastSec -> return (E.elfSectionAddr lastSec + E.elfSectionSize lastSec)
+        Just lastSec -> return (E.elfSectionAddr lastSec + E.elfSectionSize lastSec, E.elfSectionIndex lastSec)
+
+-- | Modify an ELF file by appending a new section directly after the section
+-- index given as a 'Word16'
+--
+-- FIXME: Change this to 'insertSection' that takes a function to turn the
+-- target section into a Seq of sections
+appendSectionAfter :: forall arch w
+                    . (w ~ MM.ArchAddrWidth arch)
+                   => Word16
+                   -> E.ElfSection (E.ElfWordType w)
+                   -> E.Elf w
+                   -> ElfRewriter arch ((), E.Elf w)
+appendSectionAfter targetSec newSection e =
+  return ((), e L.& E.elfFileData L.%~ appendAfter)
+  where
+    appendAfter :: Seq.Seq (E.ElfDataRegion w) -> Seq.Seq (E.ElfDataRegion w)
+    appendAfter = mconcat . map goRegion . F.toList
+    goRegion :: E.ElfDataRegion w -> Seq.Seq (E.ElfDataRegion w)
+    goRegion dr =
+      case dr of
+        E.ElfDataElfHeader -> Seq.singleton dr
+        E.ElfDataSegmentHeaders -> Seq.singleton dr
+        E.ElfDataSectionHeaders -> Seq.singleton dr
+        E.ElfDataSectionNameTable {} -> Seq.singleton dr
+        E.ElfDataGOT {} -> Seq.singleton dr
+        E.ElfDataStrtab {} -> Seq.singleton dr
+        E.ElfDataSymtab {} -> Seq.singleton dr
+        E.ElfDataRaw {} -> Seq.singleton dr
+        E.ElfDataSection sec
+          | E.elfSectionIndex sec == targetSec -> Seq.fromList [dr, E.ElfDataSection newSection]
+          | otherwise -> Seq.singleton dr
+        E.ElfDataSegment seg ->
+          Seq.singleton (E.ElfDataSegment (seg { E.elfSegmentData = appendAfter (E.elfSegmentData seg)}))
 
 -- | Traverse a segment and return the (physically) last section in the segment
 --
@@ -570,8 +633,8 @@ segmentContains secName seg =
           | secName == E.elfSectionName sec -> onFound
           | otherwise -> segmentForSection notFound onFound drs
         E.ElfDataRaw {} -> segmentForSection notFound onFound drs
-        E.ElfDataSegment seg
-          | Just _ <- segmentContains secName seg -> onFound
+        E.ElfDataSegment seg'
+          | Just _ <- segmentContains secName seg' -> onFound
           | otherwise -> segmentForSection notFound onFound drs
 
 
@@ -602,75 +665,75 @@ newFromEntry textSecIdx extraTextSecIdx layoutAddr e addr nm = e
 -- | Create a new data segment containing a single data section, containing the given bytestring
 --
 -- It will be placed at the given start address.
-newDataSegment :: (w ~ MM.ArchAddrWidth arch, Num (E.ElfWordType w), Show (E.ElfWordType w), Integral (E.ElfWordType w), Bits (E.ElfWordType w))
-               => E.ElfWordType w
-               -> B.ByteString
-               -> E.Elf w
-               -> ElfRewriter arch (E.ElfSegment w)
-newDataSegment startAddr bytes e = do
-  let sec = E.ElfSection { E.elfSectionName = C8.pack "brittle_data"
-                       , E.elfSectionType = E.SHT_PROGBITS
-                       , E.elfSectionFlags = E.shf_alloc .|. E.shf_write
-                       , E.elfSectionAddr = startAddr
-                       , E.elfSectionSize = fromIntegral (B.length bytes)
-                       , E.elfSectionLink = 0
-                       , E.elfSectionInfo = 0
-                       , E.elfSectionAddrAlign = 1
-                       , E.elfSectionEntSize = 0
-                       , E.elfSectionData = bytes
-                       , E.elfSectionIndex = nextSectionIndex e `debug` ("New data segment index: " ++ show (nextSectionIndex e))
-                       }
-  let seg = E.ElfSegment { E.elfSegmentType = E.PT_LOAD
-                       , E.elfSegmentFlags = E.pf_r .|. E.pf_w
-                       , E.elfSegmentIndex = nextSegmentIndex e
-                       , E.elfSegmentVirtAddr = startAddr
-                       , E.elfSegmentPhysAddr = startAddr
-                       , E.elfSegmentAlign = 0x200000
-                       , E.elfSegmentMemSize = E.ElfRelativeSize 0
-                       , E.elfSegmentData = Seq.singleton (E.ElfDataSection sec)
-                       }
-  return seg
+-- newDataSegment :: (w ~ MM.ArchAddrWidth arch, Num (E.ElfWordType w), Show (E.ElfWordType w), Integral (E.ElfWordType w), Bits (E.ElfWordType w))
+--                => E.ElfWordType w
+--                -> B.ByteString
+--                -> E.Elf w
+--                -> ElfRewriter arch (E.ElfSegment w)
+-- newDataSegment startAddr bytes e = do
+--   let sec = E.ElfSection { E.elfSectionName = C8.pack "brittle_data"
+--                        , E.elfSectionType = E.SHT_PROGBITS
+--                        , E.elfSectionFlags = E.shf_alloc .|. E.shf_write
+--                        , E.elfSectionAddr = startAddr
+--                        , E.elfSectionSize = fromIntegral (B.length bytes)
+--                        , E.elfSectionLink = 0
+--                        , E.elfSectionInfo = 0
+--                        , E.elfSectionAddrAlign = 1
+--                        , E.elfSectionEntSize = 0
+--                        , E.elfSectionData = bytes
+--                        , E.elfSectionIndex = nextSectionIndex e `debug` ("New data segment index: " ++ show (nextSectionIndex e))
+--                        }
+--   let seg = E.ElfSegment { E.elfSegmentType = E.PT_LOAD
+--                        , E.elfSegmentFlags = E.pf_r .|. E.pf_w
+--                        , E.elfSegmentIndex = nextSegmentIndex e
+--                        , E.elfSegmentVirtAddr = startAddr
+--                        , E.elfSegmentPhysAddr = startAddr
+--                        , E.elfSegmentAlign = 0x200000
+--                        , E.elfSegmentMemSize = E.ElfRelativeSize 0
+--                        , E.elfSegmentData = Seq.singleton (E.ElfDataSection sec)
+--                        }
+--   return seg
 
 -- | We store the program headers in their own segment so that the C runtime can
 -- look at them during libc init. Some padding is needed to get the alignment to
 -- work out. The address needs to be the start address for the elf. This can
 -- usually be calculated with `findBaseAddr`.
-newProgramHeaderSegment :: (w ~ MM.ArchAddrWidth arch, Num (E.ElfWordType w), Show (E.ElfWordType w), Integral (E.ElfWordType w), Bits (E.ElfWordType w))
-                        => E.ElfWordType w
-                        -> E.Elf w
-                        -> ElfRewriter arch (E.ElfSegment w)
-newProgramHeaderSegment baseAddr e = do
-  let layout        = E.elfLayout e
-      sz            = E.elfLayoutSize layout
-      alignedOffset = fixAlignment sz (fromIntegral pageAlignment)
-  let seg = E.ElfSegment
-            { E.elfSegmentType     = E.PT_LOAD
-            , E.elfSegmentFlags    = E.pf_r
-            , E.elfSegmentIndex    = nextSegmentIndex e
-            , E.elfSegmentVirtAddr = baseAddr + alignedOffset
-            , E.elfSegmentPhysAddr = baseAddr + alignedOffset
-            , E.elfSegmentAlign    = fromIntegral pageAlignment
-            , E.elfSegmentMemSize  = E.ElfRelativeSize 0
-            , E.elfSegmentData     = E.ElfDataSegmentHeaders Seq.<| Seq.empty
-            }
-  return seg
+-- newProgramHeaderSegment :: (w ~ MM.ArchAddrWidth arch, Num (E.ElfWordType w), Show (E.ElfWordType w), Integral (E.ElfWordType w), Bits (E.ElfWordType w))
+--                         => E.ElfWordType w
+--                         -> E.Elf w
+--                         -> ElfRewriter arch (E.ElfSegment w)
+-- newProgramHeaderSegment baseAddr e = do
+--   let layout        = E.elfLayout e
+--       sz            = E.elfLayoutSize layout
+--       alignedOffset = fixAlignment sz (fromIntegral pageAlignment)
+--   let seg = E.ElfSegment
+--             { E.elfSegmentType     = E.PT_LOAD
+--             , E.elfSegmentFlags    = E.pf_r
+--             , E.elfSegmentIndex    = nextSegmentIndex e
+--             , E.elfSegmentVirtAddr = baseAddr + alignedOffset
+--             , E.elfSegmentPhysAddr = baseAddr + alignedOffset
+--             , E.elfSegmentAlign    = fromIntegral pageAlignment
+--             , E.elfSegmentMemSize  = E.ElfRelativeSize 0
+--             , E.elfSegmentData     = E.ElfDataSegmentHeaders Seq.<| Seq.empty
+--             }
+--   return seg
 
 -- | Finds the lowest address mentioned in a "LOAD"able elf segment. We treat
 -- this as the base address that the elf file will be loaded at.
 --
 -- Note: This assumes there is at least one PT_LOAD segment, which should
 -- normally be the case.
-findBaseAddr :: forall w arch
-              . (w ~ MM.ArchAddrWidth arch, Num (E.ElfWordType w), Show (E.ElfWordType w), Integral (E.ElfWordType w), Bits (E.ElfWordType w))
-             => E.Elf w
-             -> ElfRewriter arch (E.ElfWordType w)
-findBaseAddr e = do
-  let segs :: [ E.ElfDataRegion w ]
-      segs = e L.^. E.elfFileData . L.to F.toList
-      addrs = [ E.elfSegmentVirtAddr s
-              | E.ElfDataSegment s <- segs
-              , E.elfSegmentType s == E.PT_LOAD ]
-  return $! minimum addrs
+-- findBaseAddr :: forall w arch
+--               . (w ~ MM.ArchAddrWidth arch, Num (E.ElfWordType w), Show (E.ElfWordType w), Integral (E.ElfWordType w), Bits (E.ElfWordType w))
+--              => E.Elf w
+--              -> ElfRewriter arch (E.ElfWordType w)
+-- findBaseAddr e = do
+--   let segs :: [ E.ElfDataRegion w ]
+--       segs = e L.^. E.elfFileData . L.to F.toList
+--       addrs = [ E.elfSegmentVirtAddr s
+--               | E.ElfDataSegment s <- segs
+--               , E.elfSegmentType s == E.PT_LOAD ]
+--   return $! minimum addrs
 
 -- | Replace all of the dynamically-sized data regions in the ELF file with padding.
 --
@@ -719,26 +782,32 @@ appendDataRegion r e = do
 
 -- | Append a segment to the given ELF file, adding the necessary
 -- padding before with an ElfDataRaw data region.
-appendSegment :: (w ~ MM.ArchAddrWidth arch, Ord (E.ElfWordType w), Integral (E.ElfWordType w))
-              => E.ElfSegment w
-              -> E.Elf w
-              -> ElfRewriter arch ((), E.Elf w)
-appendSegment seg e = do
-  let layout = E.elfLayout e
-      sz = E.elfLayoutSize layout
-      alignedOffset = fixAlignment sz (fromIntegral pageAlignment)
-      paddingBytes = alignedOffset - sz
-      paddingRegion = E.ElfDataRaw (B.replicate (fromIntegral paddingBytes) 0)
-  riAppendedSegments L.%= ((E.elfSegmentType seg,
-                            E.elfSegmentIndex seg,
-                            fromIntegral alignedOffset,
-                            fromIntegral paddingBytes):)
-  let dats = if paddingBytes > 0 then [ paddingRegion, E.ElfDataSegment seg ] else [ E.ElfDataSegment seg ]
-  return ((), e L.& E.elfFileData L.%~ (`mappend` Seq.fromList dats))
+-- appendSegment :: (w ~ MM.ArchAddrWidth arch, Ord (E.ElfWordType w), Integral (E.ElfWordType w))
+--               => E.ElfSegment w
+--               -> E.Elf w
+--               -> ElfRewriter arch ((), E.Elf w)
+-- appendSegment seg e = do
+--   let layout = E.elfLayout e
+--       sz = E.elfLayoutSize layout
+--       alignedOffset = fixAlignment sz (fromIntegral pageAlignment)
+--       paddingBytes = alignedOffset - sz
+--       paddingRegion = E.ElfDataRaw (B.replicate (fromIntegral paddingBytes) 0)
+--   riAppendedSegments L.%= ((E.elfSegmentType seg,
+--                             E.elfSegmentIndex seg,
+--                             fromIntegral alignedOffset,
+--                             fromIntegral paddingBytes):)
+--   let dats = if paddingBytes > 0 then [ paddingRegion, E.ElfDataSegment seg ] else [ E.ElfDataSegment seg ]
+--   return ((), e L.& E.elfFileData L.%~ (`mappend` Seq.fromList dats))
 
 -- | Append the necessary program header data onto the end of the ELF file.
 --
--- This includes: section headers, segment headers, and the section name table.
+-- This includes: section headers, string table, and the section name table.
+--
+-- NOTE: This explicitly does not include the segment headers, which we strive
+-- to not modify.
+--
+-- NOTE: It also doesn't include the symbol table, since we already put that in
+-- place earlier.
 appendHeaders :: (w ~ MM.ArchAddrWidth arch, Show (E.ElfWordType w), Bits (E.ElfWordType w), Integral (E.ElfWordType w))
               => E.Elf w
               -> ElfRewriter arch ((), E.Elf w)
@@ -762,8 +831,8 @@ nextSectionIndex e = firstAvailable 0 indexes
       | ix == next = firstAvailable (ix + 1) rest
       | otherwise = ix
 
-nextSegmentIndex :: E.Elf w -> Word16
-nextSegmentIndex = fromIntegral . length . E.elfSegments
+-- nextSegmentIndex :: E.Elf w -> Word16
+-- nextSegmentIndex = fromIntegral . length . E.elfSegments
 
 replaceSectionWithPadding :: (w ~ MM.ArchAddrWidth arch, Integral (E.ElfWordType w))
                           => E.ElfLayout w
@@ -842,37 +911,63 @@ overwriteTextSection newBytes e = do
                    , E.elfSectionSize = fromIntegral (B.length newBytes)
                    }
 
-newInstrumentationSegment :: (w ~ MM.ArchAddrWidth arch, Num (E.ElfWordType w), Show (E.ElfWordType w), Integral (E.ElfWordType w), Bits (E.ElfWordType w))
-                          => Bits (E.ElfWordType w)
-                          => E.ElfWordType w
-                          -> B.ByteString
-                          -> E.Elf w
-                          -> ElfRewriter arch (E.ElfSectionIndex, E.ElfSegment w)
-newInstrumentationSegment startAddr bytes e = do
-  let txtIdx = nextSectionIndex e
---  traceM ("New text section index: " ++ show txtIdx)
-  let sec = E.ElfSection { E.elfSectionName = C8.pack "brittle"
-                       , E.elfSectionType = E.SHT_PROGBITS
-                       , E.elfSectionFlags = E.shf_alloc .|. E.shf_execinstr
-                       , E.elfSectionAddr = startAddr
-                       , E.elfSectionSize = fromIntegral (B.length bytes)
-                       , E.elfSectionLink = 0
-                       , E.elfSectionInfo = 0
-                       , E.elfSectionAddrAlign = 1
-                       , E.elfSectionEntSize = 0
-                       , E.elfSectionData = bytes
-                       , E.elfSectionIndex = txtIdx
-                       }
-  let seg = E.ElfSegment { E.elfSegmentType = E.PT_LOAD
-                       , E.elfSegmentFlags = E.pf_r .|. E.pf_x
-                       , E.elfSegmentIndex = nextSegmentIndex e
-                       , E.elfSegmentVirtAddr = startAddr
-                       , E.elfSegmentPhysAddr = startAddr
-                       , E.elfSegmentAlign = 0x200000
-                       , E.elfSegmentMemSize = E.ElfRelativeSize 0
-                       , E.elfSegmentData = Seq.singleton (E.ElfDataSection sec)
-                       }
-  return (E.ElfSectionIndex txtIdx, seg)
+newTextSection :: ( w ~ MM.ArchAddrWidth arch
+                  , Num (E.ElfWordType w)
+                  , Show (E.ElfWordType w)
+                  , Bits (E.ElfWordType w)
+                  , Integral (E.ElfWordType w)
+                  )
+               => E.ElfWordType w
+               -> B.ByteString
+               -> E.Elf w
+               -> ElfRewriter arch (E.ElfSectionIndex, E.ElfSection (E.ElfWordType w))
+newTextSection startAddr bytes e = do
+  let newTextIdx = nextSectionIndex e
+  let sec = E.ElfSection { E.elfSectionName = C8.pack ".brittle"
+                         , E.elfSectionType = E.SHT_PROGBITS
+                         , E.elfSectionFlags = E.shf_alloc .|. E.shf_execinstr
+                         , E.elfSectionAddr = startAddr
+                         , E.elfSectionSize = fromIntegral (B.length bytes)
+                         , E.elfSectionLink = 0
+                         , E.elfSectionInfo = 0
+                         , E.elfSectionAddrAlign = 1
+                         , E.elfSectionEntSize = 0
+                         , E.elfSectionData = bytes
+                         , E.elfSectionIndex = newTextIdx
+                         }
+  return (E.ElfSectionIndex newTextIdx, sec)
+
+-- newInstrumentationSegment :: (w ~ MM.ArchAddrWidth arch, Num (E.ElfWordType w), Show (E.ElfWordType w), Integral (E.ElfWordType w), Bits (E.ElfWordType w))
+--                           => Bits (E.ElfWordType w)
+--                           => E.ElfWordType w
+--                           -> B.ByteString
+--                           -> E.Elf w
+--                           -> ElfRewriter arch (E.ElfSectionIndex, E.ElfSegment w)
+-- newInstrumentationSegment startAddr bytes e = do
+--   let txtIdx = nextSectionIndex e
+-- --  traceM ("New text section index: " ++ show txtIdx)
+--   let sec = E.ElfSection { E.elfSectionName = C8.pack "brittle"
+--                        , E.elfSectionType = E.SHT_PROGBITS
+--                        , E.elfSectionFlags = E.shf_alloc .|. E.shf_execinstr
+--                        , E.elfSectionAddr = startAddr
+--                        , E.elfSectionSize = fromIntegral (B.length bytes)
+--                        , E.elfSectionLink = 0
+--                        , E.elfSectionInfo = 0
+--                        , E.elfSectionAddrAlign = 1
+--                        , E.elfSectionEntSize = 0
+--                        , E.elfSectionData = bytes
+--                        , E.elfSectionIndex = txtIdx
+--                        }
+--   let seg = E.ElfSegment { E.elfSegmentType = E.PT_LOAD
+--                        , E.elfSegmentFlags = E.pf_r .|. E.pf_x
+--                        , E.elfSegmentIndex = nextSegmentIndex e
+--                        , E.elfSegmentVirtAddr = startAddr
+--                        , E.elfSegmentPhysAddr = startAddr
+--                        , E.elfSegmentAlign = 0x200000
+--                        , E.elfSegmentMemSize = E.ElfRelativeSize 0
+--                        , E.elfSegmentData = Seq.singleton (E.ElfDataSection sec)
+--                        }
+--   return (E.ElfSectionIndex txtIdx, seg)
 
 -- | Apply the instrumentor to the given section (which should be the
 -- .text section), while laying out the instrumented version of the
