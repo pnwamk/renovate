@@ -607,7 +607,7 @@ foldSections f r seed =
 findLastSection :: Seq.Seq (E.ElfDataRegion w) -> Maybe (E.ElfSection (E.ElfWordType w))
 findLastSection = F.foldr go Nothing
   where
-    go r msec =
+    go r _msec =
       case r of
         E.ElfDataElfHeader -> Nothing
         E.ElfDataSegmentHeaders -> Nothing
