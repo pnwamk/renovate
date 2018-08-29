@@ -412,7 +412,10 @@ doRewrite cfg loadedBinary symmap strat = do
   -- and we aren't in a great position to compute the real size (since there are
   -- going to be some things in the segment with non-obvious sizes that can't be
   -- computed until layout time).
-  modifyCurrentELF (appendSectionAfter lastTextSecId newTextSec)
+  modifyCurrentELF (mapElfSection (\sec -> if E.elfSectionIndex sec == lastTextSecId
+                                           then Seq.fromList [E.ElfDataSection sec, E.ElfDataSection newTextSec]
+                                           else Seq.singleton (E.ElfDataSection sec)))
+  -- modifyCurrentELF (appendSectionAfter lastTextSecId newTextSec)
 
   -- FIXME: Now we need to do another traversal where we fix the alignment of
   -- the data in the data segment.  We have to drop the alignment from 2MB down
@@ -423,8 +426,10 @@ doRewrite cfg loadedBinary symmap strat = do
   --
   -- Later, we will have to perform a further adjustment including adding any
   -- new static data to the beginning of the segment.
-  dataSeg <- withCurrentELF lookupDataSegment
-  modifyCurrentELF (fixDataAlignment (E.elfSegmentIndex dataSeg) instrumentedBytes)
+  mDataSeg <- withCurrentELF (return . findSegmentContainingLoadableSection ".data" . F.toList . (L.^. E.elfFileData))
+  case mDataSeg of
+    Nothing -> return ()
+    Just dataSeg -> modifyCurrentELF (fixDataAlignment (E.elfSegmentIndex dataSeg) instrumentedBytes)
 
   -- case mNewData of
   --   Nothing -> return ()
@@ -538,22 +543,23 @@ getNewTextAddress e =
         Nothing -> C.throwM CannotAllocateTextSection
         Just lastSec -> return (E.elfSectionAddr lastSec + E.elfSectionSize lastSec, E.elfSectionIndex lastSec)
 
--- | Modify an ELF file by appending a new section directly after the section
--- index given as a 'Word16'
+-- | Modify an ELF file by mapping sections to a sequence of data regions.
 --
--- FIXME: Change this to 'insertSection' that takes a function to turn the
--- target section into a Seq of sections
-appendSectionAfter :: forall arch w
-                    . (w ~ MM.ArchAddrWidth arch)
-                   => Word16
-                   -> E.ElfSection (E.ElfWordType w)
-                   -> E.Elf w
-                   -> ElfRewriter arch ((), E.Elf w)
-appendSectionAfter targetSec newSection e =
-  return ((), e L.& E.elfFileData L.%~ appendAfter)
+-- To leave a section unmodified, create a singleton data region (with 'E.ElfDataSection')
+--
+-- This function is general enough to support adding sections before or after an
+-- existing section or replacing a section entirely.
+mapElfSection :: forall arch w
+               . (w ~ MM.ArchAddrWidth arch)
+              => (E.ElfSection (E.ElfWordType w) -> Seq.Seq (E.ElfDataRegion w)) -- Section (E.ElfWordType w)))
+              -- ^ A function to apply to the singleton sequence of elf sections contained in the segment
+              -> E.Elf w
+              -> ElfRewriter arch ((), E.Elf w)
+mapElfSection f e =
+  return ((), e L.& E.elfFileData L.%~ goRegions)
   where
-    appendAfter :: Seq.Seq (E.ElfDataRegion w) -> Seq.Seq (E.ElfDataRegion w)
-    appendAfter = mconcat . map goRegion . F.toList
+    goRegions :: Seq.Seq (E.ElfDataRegion w) -> Seq.Seq (E.ElfDataRegion w)
+    goRegions = mconcat . map goRegion . F.toList
     goRegion :: E.ElfDataRegion w -> Seq.Seq (E.ElfDataRegion w)
     goRegion dr =
       case dr of
@@ -565,11 +571,40 @@ appendSectionAfter targetSec newSection e =
         E.ElfDataStrtab {} -> Seq.singleton dr
         E.ElfDataSymtab {} -> Seq.singleton dr
         E.ElfDataRaw {} -> Seq.singleton dr
-        E.ElfDataSection sec
-          | E.elfSectionIndex sec == targetSec -> Seq.fromList [dr, E.ElfDataSection newSection]
-          | otherwise -> Seq.singleton dr
+        E.ElfDataSection sec -> f sec
         E.ElfDataSegment seg ->
-          Seq.singleton (E.ElfDataSegment (seg { E.elfSegmentData = appendAfter (E.elfSegmentData seg)}))
+          Seq.singleton (E.ElfDataSegment (seg { E.elfSegmentData = goRegions (E.elfSegmentData seg)}))
+
+-- | Fix the alignment of the given segment given that we are adding @bytes@ before it into the executable
+--
+-- We want to drop the alignment of the segment to be the maximum of the
+-- alignment of any section.  We then need to add a data region (with zeroes) as
+-- the first item in the segment to maintain the congruence constraint on
+-- segment alignment.
+--
+-- If we are adding @extra@ bytes of new text to the file (which shifts the
+-- offsets of everything else), we need to add
+--
+-- > align - (extra % align)
+--
+-- bytes to the start of the data section.
+fixDataAlignment :: (w ~ MM.ArchAddrWidth arch)
+                 => E.SegmentIndex
+                 -> B.ByteString
+                 -> E.Elf w
+                 -> ElfRewriter arch ((), E.Elf w)
+fixDataAlignment targetSegIdx bytes e0 =
+  ((),) <$> E.traverseElfSegments replaceTargetSegment e0
+  where
+    replaceTargetSegment seg
+      | E.elfSegmentIndex seg == targetSegIdx = do
+          let maxSectionAlign = undefined
+          let paddingBytes = maxSectionAlign - (B.length bytes `mod` maxSectionAlign)
+          let paddingRegion = E.ElfDataRaw (B.replicate paddingBytes 0)
+          return seg { E.elfSegmentData = paddingRegion Seq.<| E.elfSegmentData seg
+                     , E.elfSegmentAlign = maxSectionAlign
+                     }
+      | otherwise = return seg
 
 -- | Traverse a segment and return the (physically) last section in the segment
 --
