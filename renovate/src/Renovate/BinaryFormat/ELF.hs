@@ -397,9 +397,11 @@ doRewrite cfg loadedBinary symmap strat = do
   -- and we aren't in a great position to compute the real size (since there are
   -- going to be some things in the segment with non-obvious sizes that can't be
   -- computed until layout time).
-  modifyCurrentELF (mapElfSection (\sec -> if E.elfSectionIndex sec == lastTextSecId
-                                           then Seq.fromList [E.ElfDataSection sec, E.ElfDataSection newTextSec]
-                                           else Seq.singleton (E.ElfDataSection sec)))
+  let insertAfter sec
+        | E.elfSectionIndex sec == lastTextSecId = Seq.fromList [E.ElfDataSection sec, E.ElfDataSection newTextSec]
+        | otherwise = Seq.singleton (E.ElfDataSection sec)
+  let doAdjustSection e = return ((), e L.& E.elfFileData L.%~ adjustElfSection insertAfter)
+  modifyCurrentELF doAdjustSection
 
   -- Now we need to do another traversal where we fix the alignment of the data
   -- in the data segment.  We have to drop the alignment from 2MB down to
@@ -514,7 +516,7 @@ getNewTextAddress e =
   case findSegmentContainingLoadableSection ".text" (F.toList (e L.^. E.elfFileData)) of
     Nothing -> C.throwM (NoSectionFound ".text")
     Just seg -> do
-      case findLastSection seg of
+      case findLastSection (E.elfSegmentData seg) of
         Nothing -> C.throwM CannotAllocateTextSection
         Just lastSec -> return (E.elfSectionAddr lastSec + E.elfSectionSize lastSec, E.elfSectionIndex lastSec)
 
@@ -523,32 +525,30 @@ getNewTextAddress e =
 -- To leave a section unmodified, create a singleton data region (with 'E.ElfDataSection')
 --
 -- This function is general enough to support adding sections before or after an
--- existing section or replacing a section entirely.
-mapElfSection :: forall arch w
-               . (w ~ MM.ArchAddrWidth arch)
-              => (E.ElfSection (E.ElfWordType w) -> Seq.Seq (E.ElfDataRegion w)) -- Section (E.ElfWordType w)))
-              -- ^ A function to apply to the singleton sequence of elf sections contained in the segment
-              -> E.Elf w
-              -> ElfRewriter arch ((), E.Elf w)
-mapElfSection f e =
-  return ((), e L.& E.elfFileData L.%~ goRegions)
+-- existing section, replacing a section, or removing a section.
+adjustElfSection :: forall w
+                   . (E.ElfSection (E.ElfWordType w) -> Seq.Seq (E.ElfDataRegion w))
+                   -- ^ A function to apply to an 'E.ElfSection' that will
+                   -- provide the replacement sequence of data (which could be
+                   -- sections or other data regions)
+                  -> Seq.Seq (E.ElfDataRegion w)
+                  -> Seq.Seq (E.ElfDataRegion w)
+adjustElfSection f = mconcat . map go . F.toList
   where
-    goRegions :: Seq.Seq (E.ElfDataRegion w) -> Seq.Seq (E.ElfDataRegion w)
-    goRegions = mconcat . map goRegion . F.toList
-    goRegion :: E.ElfDataRegion w -> Seq.Seq (E.ElfDataRegion w)
-    goRegion dr =
-      case dr of
-        E.ElfDataElfHeader -> Seq.singleton dr
-        E.ElfDataSegmentHeaders -> Seq.singleton dr
-        E.ElfDataSectionHeaders -> Seq.singleton dr
-        E.ElfDataSectionNameTable {} -> Seq.singleton dr
-        E.ElfDataGOT {} -> Seq.singleton dr
-        E.ElfDataStrtab {} -> Seq.singleton dr
-        E.ElfDataSymtab {} -> Seq.singleton dr
-        E.ElfDataRaw {} -> Seq.singleton dr
+    go :: E.ElfDataRegion w -> Seq.Seq (E.ElfDataRegion w)
+    go r =
+      case r of
+        E.ElfDataElfHeader -> Seq.singleton r
+        E.ElfDataSegmentHeaders -> Seq.singleton r
+        E.ElfDataSectionHeaders -> Seq.singleton r
+        E.ElfDataSectionNameTable {} -> Seq.singleton r
+        E.ElfDataGOT {} -> Seq.singleton r
+        E.ElfDataStrtab {} -> Seq.singleton r
+        E.ElfDataSymtab {} -> Seq.singleton r
+        E.ElfDataRaw {} -> Seq.singleton r
         E.ElfDataSection sec -> f sec
         E.ElfDataSegment seg ->
-          Seq.singleton (E.ElfDataSegment (seg { E.elfSegmentData = goRegions (E.elfSegmentData seg)}))
+          Seq.singleton (E.ElfDataSegment (seg { E.elfSegmentData = adjustElfSection f (E.elfSegmentData seg)}))
 
 -- | Fix the alignment of the given segment given that we are adding @bytes@ before it into the executable
 --
@@ -601,28 +601,24 @@ foldSections f r seed =
     E.ElfDataSection sec -> f sec seed
     E.ElfDataRaw {} -> seed
 
-
 -- | Traverse a segment and return the (physically) last section in the segment
 --
 -- If the last thing in the segment is not a section, fail.
-findLastSection :: E.ElfSegment w -> Maybe (E.ElfSection (E.ElfWordType w))
-findLastSection seg = go (F.toList (E.elfSegmentData seg)) Nothing
+findLastSection :: Seq.Seq (E.ElfDataRegion w) -> Maybe (E.ElfSection (E.ElfWordType w))
+findLastSection = F.foldr go Nothing
   where
-    go dataRegions msec =
-      case dataRegions of
-        [] -> msec
-        (dr:drs) ->
-          case dr of
-            E.ElfDataElfHeader -> go drs Nothing
-            E.ElfDataSegmentHeaders -> go drs Nothing
-            E.ElfDataSegment seg' -> findLastSection seg'
-            E.ElfDataSectionHeaders -> go drs Nothing
-            E.ElfDataSectionNameTable {} -> go drs Nothing
-            E.ElfDataGOT {} -> go drs Nothing
-            E.ElfDataStrtab {} -> go drs Nothing
-            E.ElfDataSymtab {} -> go drs Nothing
-            E.ElfDataSection sec -> go drs (Just sec)
-            E.ElfDataRaw {} -> go drs Nothing
+    go r msec =
+      case r of
+        E.ElfDataElfHeader -> Nothing
+        E.ElfDataSegmentHeaders -> Nothing
+        E.ElfDataSegment seg' -> findLastSection (E.elfSegmentData seg')
+        E.ElfDataSectionHeaders -> Nothing
+        E.ElfDataSectionNameTable {} -> Nothing
+        E.ElfDataGOT {} -> Nothing
+        E.ElfDataStrtab {} -> Nothing
+        E.ElfDataSymtab {} -> Nothing
+        E.ElfDataSection sec -> Just sec
+        E.ElfDataRaw {} -> Nothing
 
 findSegmentContainingLoadableSection :: B.ByteString
                                      -> [E.ElfDataRegion w]
