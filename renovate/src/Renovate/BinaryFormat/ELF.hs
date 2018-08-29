@@ -397,11 +397,11 @@ doRewrite cfg loadedBinary symmap strat = do
   -- and we aren't in a great position to compute the real size (since there are
   -- going to be some things in the segment with non-obvious sizes that can't be
   -- computed until layout time).
-  let insertAfter sec
+  let insertNewTextAfter sec
         | E.elfSectionIndex sec == lastTextSecId = Seq.fromList [E.ElfDataSection sec, E.ElfDataSection newTextSec]
         | otherwise = Seq.singleton (E.ElfDataSection sec)
-  let doAdjustSection e = return ((), e L.& E.elfFileData L.%~ adjustElfSection insertAfter)
-  modifyCurrentELF doAdjustSection
+  let doAdjustExecutableSegment e = return ((), e L.& E.elfFileData L.%~ adjustElfSection insertNewTextAfter)
+  modifyCurrentELF doAdjustExecutableSegment
 
   -- Now we need to do another traversal where we fix the alignment of the data
   -- in the data segment.  We have to drop the alignment from 2MB down to
