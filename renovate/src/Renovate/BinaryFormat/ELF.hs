@@ -66,7 +66,7 @@ import qualified Data.Generics.Product as GL
 import qualified Data.List as L
 import qualified Data.List.NonEmpty as NEL
 import qualified Data.Map as Map
-import           Data.Maybe ( catMaybes, maybeToList, listToMaybe )
+import           Data.Maybe ( catMaybes, maybeToList, listToMaybe, isJust )
 import           Data.Monoid
 import qualified Data.Ord as O
 import qualified Data.Sequence as Seq
@@ -339,7 +339,7 @@ doRewrite cfg loadedBinary symmap strat = do
   -- a number of sections directly after .text (e.g., .fini, .rodata,
   -- .eh_frame_hdr, .eh_frame, and probably others), so the safest thing to do
   -- is figure out the next address after the end of the containing segment.
-  (newTextAddr, lastTextSecId) <- withCurrentELF getNewTextAddress
+  newTextAddr <- withCurrentELF (getNewTextAddress textSection (rcCodeLayoutBase cfg))
 --  traceM $ printf "Extra text section layout address is 0x%x" (fromIntegral nextSegmentAddress :: Word64)
   riSegmentVirtualAddress L..= Just (fromIntegral newTextAddr)
 
@@ -397,11 +397,15 @@ doRewrite cfg loadedBinary symmap strat = do
   -- and we aren't in a great position to compute the real size (since there are
   -- going to be some things in the segment with non-obvious sizes that can't be
   -- computed until layout time).
-  let insertNewTextAfter sec
-        | E.elfSectionIndex sec == lastTextSecId = Seq.fromList [E.ElfDataSection sec, E.ElfDataSection newTextSec]
-        | otherwise = Seq.singleton (E.ElfDataSection sec)
-  let doAdjustExecutableSegment e = return ((), e L.& E.elfFileData L.%~ adjustElfSection insertNewTextAfter)
-  modifyCurrentELF doAdjustExecutableSegment
+
+  -- let insertNewTextAfter sec
+  --       | E.elfSectionIndex sec == lastTextSecId = Seq.fromList [E.ElfDataSection sec, E.ElfDataSection newTextSec]
+  --       | otherwise = Seq.singleton (E.ElfDataSection sec)
+  -- let doAdjustExecutableSegment e = return ((), e L.& E.elfFileData L.%~ adjustElfSection insertNewTextAfter)
+  -- modifyCurrentELF doAdjustExecutableSegment
+
+  let newTextSegment = undefined
+  modifyCurrentELF (appendSegment newTextSegment)
 
   -- Now we need to do another traversal where we fix the alignment of the data
   -- in the data segment.  We have to drop the alignment from 2MB down to
@@ -429,7 +433,68 @@ doRewrite cfg loadedBinary symmap strat = do
   -- Now overwrite the original code (in the .text segment) with the
   -- content computed by our transformation.
   modifyCurrentELF (overwriteTextSection overwrittenBytes)
+
+
+  -- Increment all of the segment indexes so that we can reserve the first
+  -- segment index (0) for our fresh PHDR segment that we want at the beginning
+  -- of the PHDR table (but not at the first offset)
+  modifyCurrentELF (\e -> ((),) <$> E.traverseElfSegments incrementSegmentNumber e)
+  modifyCurrentELF (appendSegment (phdrSegment 0x40))
   return analysisResult
+
+-- | Count the number of program headers (i.e., entries in the PHDR table)
+--
+-- This is really just the number of segments, but 'E.elfSegmentCount' is not
+-- accurate anymore, as elf-edit has special handling for the GNU_STACK segment
+-- and RELRO regions.
+programHeaderCount :: E.Elf w -> Int
+programHeaderCount e = sum [ E.elfSegmentCount e
+                           , if isJust (E.elfGnuStackSegment e) then 1 else 0
+                           , length (E.elfGnuRelroRegions e)
+                           ]
+
+appendSegment :: ( w ~ MM.ArchAddrWidth arch
+                 , E.ElfWidthConstraints w
+                 )
+              => E.ElfSegment w
+              -> E.Elf w
+              -> ElfRewriter arch ((), E.Elf w)
+appendSegment seg e = do
+  let layout = E.elfLayout e
+  let sz = E.elfLayoutSize layout
+  -- The sz is the current offset (if we were to append the segment right here)
+  --
+  -- We need to make sure that the actual offset and the virtual address of the
+  -- segment are congruent (w.r.t. the segment alignment), so we'll insert some
+  -- padding data if necessary
+  let align = E.elfSegmentAlign seg
+  let desiredOffset = fixAlignment sz align
+  let paddingBytes = desiredOffset - sz
+  let paddingRegion = E.ElfDataRaw (B.replicate (fromIntegral paddingBytes) 0)
+  let newRegions = if paddingBytes > 0 then [ paddingRegion, E.ElfDataSegment seg ] else [ E.ElfDataSegment seg ]
+  return ((), e L.& E.elfFileData L.%~ (`mappend` Seq.fromList newRegions))
+
+-- | Create a fresh segment containing only the PHDR table
+--
+-- We choose 0 as the segment index, so ensure that we've already made space in
+-- the segment index space for it (by e.g., incrementing all of the other
+-- segment indexes).
+phdrSegment :: (E.ElfWidthConstraints w) => E.ElfWordType w -> E.ElfSegment w
+phdrSegment addr =
+  E.ElfSegment { E.elfSegmentType = E.PT_PHDR
+                 -- PowerPC binaries have a PHDR segment and make it
+                 -- executable - not sure if that is required...
+               , E.elfSegmentFlags = E.pf_r .|. E.pf_x
+               , E.elfSegmentIndex = 0
+               , E.elfSegmentVirtAddr = addr
+               , E.elfSegmentPhysAddr = addr
+               , E.elfSegmentAlign = 0x8
+               , E.elfSegmentMemSize = E.ElfRelativeSize 0
+               , E.elfSegmentData = Seq.singleton E.ElfDataSegmentHeaders
+               }
+
+incrementSegmentNumber :: (Monad m) => E.ElfSegment w -> m (E.ElfSegment w)
+incrementSegmentNumber seg = return seg { E.elfSegmentIndex = E.elfSegmentIndex seg + 1 }
 
 -- | The analysis driver
 doAnalysis :: (B.InstructionConstraints arch,
@@ -508,17 +573,25 @@ buildNewSymbolTable textSecIdx extraTextSecIdx layoutAddr newSyms baseTable elf
 -- Also returns the index of the last section, which is used to identify where
 -- to insert the new text section while building a new ELF file.
 getNewTextAddress :: ( w ~ MM.ArchAddrWidth arch
-                     , Num (E.ElfWordType w)
+                     , E.ElfWidthConstraints w
                      )
-                  => E.Elf w
-                  -> ElfRewriter arch (E.ElfWordType w, Word16)
-getNewTextAddress e =
-  case findSegmentContainingLoadableSection ".text" (F.toList (e L.^. E.elfFileData)) of
-    Nothing -> C.throwM (NoSectionFound ".text")
-    Just seg -> do
-      case findLastSection (E.elfSegmentData seg) of
-        Nothing -> C.throwM CannotAllocateTextSection
-        Just lastSec -> return (E.elfSectionAddr lastSec + E.elfSectionSize lastSec, E.elfSectionIndex lastSec)
+                  => E.ElfSection (E.ElfWordType w)
+                  -> Word64
+                  -> E.Elf w
+                  -> ElfRewriter arch (E.ElfWordType w)
+getNewTextAddress textSection segBaseAddr e = do
+  let layout = E.elfLayout e
+  let currentOffset = E.elfLayoutSize layout
+  let desiredOffset = fixAlignment currentOffset (E.elfSectionAddrAlign textSection)
+  return (fromIntegral segBaseAddr + fromIntegral desiredOffset)
+  -- case findSegmentContainingLoadableSection ".text" (F.toList (e L.^. E.elfFileData)) of
+  --   Nothing -> C.throwM (NoSectionFound ".text")
+  --   Just seg -> do
+  --     traceM ("Address of segment containing .text: " ++ show (E.elfSegmentVirtAddr seg))
+  --     mlast <- findLastSection (E.elfSegmentData seg)
+  --     case mlast of
+  --       Nothing -> C.throwM CannotAllocateTextSection
+  --       Just lastSec -> return (E.elfSectionAddr lastSec + E.elfSectionSize lastSec, E.elfSectionIndex lastSec)
 
 -- | Modify an ELF file by mapping sections to a sequence of data regions.
 --
@@ -604,21 +677,21 @@ foldSections f r seed =
 -- | Traverse a segment and return the (physically) last section in the segment
 --
 -- If the last thing in the segment is not a section, fail.
-findLastSection :: Seq.Seq (E.ElfDataRegion w) -> Maybe (E.ElfSection (E.ElfWordType w))
-findLastSection = F.foldr go Nothing
+findLastSection :: (E.ElfWidthConstraints w, Monad m) => Seq.Seq (E.ElfDataRegion w) -> m (Maybe (E.ElfSection (E.ElfWordType w)))
+findLastSection = F.foldlM go Nothing
   where
-    go r _msec =
+    go _msec r =
       case r of
-        E.ElfDataElfHeader -> Nothing
-        E.ElfDataSegmentHeaders -> Nothing
+        E.ElfDataElfHeader -> return Nothing
+        E.ElfDataSegmentHeaders -> return Nothing
         E.ElfDataSegment seg' -> findLastSection (E.elfSegmentData seg')
-        E.ElfDataSectionHeaders -> Nothing
-        E.ElfDataSectionNameTable {} -> Nothing
-        E.ElfDataGOT {} -> Nothing
-        E.ElfDataStrtab {} -> Nothing
-        E.ElfDataSymtab {} -> Nothing
-        E.ElfDataSection sec -> Just sec
-        E.ElfDataRaw {} -> Nothing
+        E.ElfDataSectionHeaders -> return Nothing
+        E.ElfDataSectionNameTable {} -> return Nothing
+        E.ElfDataGOT {} -> return Nothing
+        E.ElfDataStrtab {} -> return Nothing
+        E.ElfDataSymtab {} -> return Nothing
+        E.ElfDataSection sec -> return (Just sec)
+        E.ElfDataRaw {} -> return Nothing
 
 findSegmentContainingLoadableSection :: B.ByteString
                                      -> [E.ElfDataRegion w]
