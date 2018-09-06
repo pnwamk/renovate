@@ -69,9 +69,12 @@ symbolizeJumps symAddrMap (cb, symAddr) = do
       AbsoluteJump _ target -> do
         symTarget <- lookupSymbolicAddress isa iaddr target
         return $ isaSymbolizeAddresses isa mem lookupSymAddr addr (Just symTarget) i
-      RelativeJump _ _ offset -> do
-        symTarget <- lookupSymbolicAddress isa iaddr (addr `addressAddOffset` offset)
-        return $ isaSymbolizeAddresses isa mem lookupSymAddr addr (Just symTarget) i
+      RelativeJump _ _ offset
+        | absoluteAddress addr + fromIntegral offset < absoluteAddress concAddr + fromIntegral (concreteBlockSize isa cb) ->
+          return $ isaSymbolizeAddresses isa mem lookupSymAddr addr Nothing i
+        | otherwise -> do
+          symTarget <- lookupSymbolicAddress isa iaddr (addr `addressAddOffset` offset)
+          return $ isaSymbolizeAddresses isa mem lookupSymAddr addr (Just symTarget) i
       IndirectJump _ ->
         -- We do not know the destination of indirect jumps, so we
         -- can't tag them (or rewrite them later)

@@ -54,6 +54,7 @@ library
                        generic-lens >= 0.5 && < 1.1,
                        located-base >= 0.1 && < 0.2,
                        prettyprinter,
+                       ansi-wl-pprint,
                        parameterized-utils,
                        macaw-base,
                        -- macaw-semmc is only for the binary loader (for now)

@@ -51,13 +51,15 @@ import qualified Lang.Crucible.CFG.Extension as C
 import qualified Lang.Crucible.FunctionHandle as C
 import qualified What4.FunctionName as C
 import qualified What4.ProgramLoc as C
-import qualified What4.Interface as WI
 
 import           Renovate.Address
 import           Renovate.BasicBlock
 import           Renovate.Diagnostic
 import           Renovate.ISA
 import           Renovate.Redirect.Monad ( SymbolMap )
+
+import Debug.Trace
+import qualified Text.PrettyPrint.ANSI.Leijen as PP
 
 type ArchBits arch = (  MC.ArchConstraints arch,
                         MC.RegisterInfo (MC.ArchReg arch),
@@ -165,14 +167,30 @@ cfgFromAddrsWith recovery mem symbols initAddrs memWords = do
   where
     s0 = MC.emptyDiscoveryState mem symbols (recoveryArchInfo recovery)
 
+-- There can be overlapping blocks, but there should be no blocks (that differ) that start at the same location
+accumulateBlocks :: (MC.MemWidth (MC.ArchAddrWidth arch))
+                 => M.Map (MC.ArchSegmentOff arch) (PU.Some (MC.ParsedBlock arch))
+                 -> PU.Some (MC.ParsedBlock arch)
+                 -> M.Map (MC.ArchSegmentOff arch) (PU.Some (MC.ParsedBlock arch))
+accumulateBlocks m (PU.Some pb0)
+  | Just (PU.Some pb) <- M.lookup (MC.pblockAddr pb0) m
+  , MC.blockSize pb0 == MC.blockSize pb = m
+  | Just _ <- M.lookup (MC.pblockAddr pb0) m =
+      error ("Unexpected duplicate (but different) blocks at address: " ++ show (MC.pblockAddr pb0))
+  | otherwise = M.insert (MC.pblockAddr pb0) (PU.Some pb0) m
+
 blockInfo :: (ArchBits arch)
           => Recovery arch
           -> MC.Memory (MC.RegAddrWidth (MC.ArchReg arch))
           -> MC.DiscoveryState arch
           -> IO (BlockInfo arch)
 blockInfo recovery mem di = do
-  let blockBuilder = buildBlock (recoveryISA recovery) (recoveryDis recovery) mem (S.fromList (mapMaybe (concreteFromSegmentOff mem) (F.toList absoluteBlockStarts)))
-  blocks <- catMaybes <$> mapM blockBuilder (F.toList absoluteBlockStarts)
+  let blockBuilder = buildBlock (recoveryDis recovery) mem (S.fromList (mapMaybe (concreteFromSegmentOff mem) (F.toList absoluteBlockStarts)))
+  let macawBlocks = F.foldl' accumulateBlocks M.empty [ PU.Some pb
+                                                      | PU.Some dfi <- M.elems (di L.^. MC.funInfo)
+                                                      , pb <- M.elems (dfi L.^. MC.parsedBlocks)
+                                                      ]
+  blocks <- catMaybes <$> mapM blockBuilder (M.elems macawBlocks) -- (F.toList absoluteBlockStarts)
   let addBlock m b = M.insert (basicBlockAddress b) b m
   let blockIndex = F.foldl' addBlock M.empty blocks
   let funcBlocks = M.fromList [ (funcAddr, mapMaybe (\a -> M.lookup a blockIndex) blockAddrs)
@@ -187,6 +205,9 @@ blockInfo recovery mem di = do
       funcAddr <- concreteFromSegmentOff mem (MC.discoveredFunAddr dfi)
       cfgGen <- toCFG (recoveryHandleAllocator recovery) dfi
       return (return (Just (funcAddr, SymbolicCFG ior (stToIO cfgGen))))
+
+  -- F.forM_ (M.elems (di L.^. MC.funInfo)) $ \(PU.Some dfi) -> do
+  --   print (PP.pretty dfi)
 
   return BlockInfo { biBlocks = blocks
                    , biFunctionEntries = mapMaybe (concreteFromSegmentOff mem) funcEntries
@@ -244,27 +265,28 @@ toMacawSymbolMap mem sm = return (M.mapKeys toSegOff sm)
 -- start address until we hit a terminator instruction or the start of
 -- another basic block.
 buildBlock :: (L.HasCallStack, MC.MemWidth (MC.ArchAddrWidth arch), C.MonadThrow m)
-           => ISA arch
-           -> (B.ByteString -> Maybe (Int, Instruction arch ()))
+           => (B.ByteString -> Maybe (Int, Instruction arch ()))
            -- ^ The function to pull a single instruction off of the
            -- byte stream; it returns the number of bytes consumed and
            -- the new instruction.
            -> MC.Memory (MC.ArchAddrWidth arch)
            -> S.Set (ConcreteAddress arch)
            -- ^ The set of all basic block entry points
-           -> MC.MemSegmentOff (MC.ArchAddrWidth arch)
+           -> PU.Some (MC.ParsedBlock arch)
            -- ^ The address to start disassembling this block from
            -> m (Maybe (ConcreteBlock arch))
-buildBlock isa dis1 mem absStarts segAddr
+buildBlock dis1 mem absStarts (PU.Some pb)
   | Just concAddr <- concreteFromSegmentOff mem segAddr = do
       case MC.addrContentsAfter mem (MC.relativeSegmentAddr segAddr) of
         Left err -> C.throwM (MemoryError err)
-        Right [MC.ByteRegion bs] -> Just <$> go concAddr concAddr (S.lookupGT concAddr absStarts) bs []
+        Right [MC.ByteRegion bs] -> do
+          let stopAddr = concAddr `addressAddOffset` fromIntegral (MC.blockSize pb)
+          Just <$> go concAddr concAddr stopAddr bs []
         _ -> C.throwM (NoByteRegionAtAddress (MC.relativeSegmentAddr segAddr))
   | otherwise = return Nothing
   where
+    segAddr = MC.pblockAddr pb
     addOff       = addressAddOffset
-    isJustAnd    = maybe False
     go blockAbsAddr insnAddr stopAddr bs insns = do
       case dis1 bs of
         -- Actually, we should probably never hit this case.  We
@@ -276,14 +298,13 @@ buildBlock isa dis1 mem absStarts segAddr
         Just (bytesRead, i)
           -- We have parsed an instruction that crosses a block boundary. We
           -- should probably give up -- this executable is too wonky.
-          | isJustAnd (nextAddr>) stopAddr -> do
+          | nextAddr > stopAddr -> do
             C.throwM (OverlappingBlocks insnAddr)
 
           -- The next instruction we would decode starts another
           -- block, OR the instruction we just decoded is a
           -- terminator, so end the block and stop decoding
-          | isJustAnd (nextAddr==) stopAddr ||
-            isaJumpType isa i mem insnAddr /= NoJump -> do
+          | nextAddr == stopAddr -> do
             return BasicBlock { basicBlockAddress      = blockAbsAddr
                               , basicBlockInstructions = reverse (i : insns)
                               }
