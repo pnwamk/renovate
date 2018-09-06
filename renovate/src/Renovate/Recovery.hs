@@ -41,6 +41,7 @@ import qualified Data.Traversable as T
 import qualified Data.Macaw.Architecture.Info as MC
 import qualified Data.Macaw.CFG as MC
 import qualified Data.Macaw.Discovery as MC
+import qualified Data.Macaw.Memory.Permissions as MMP
 import qualified Data.Macaw.Types as MC
 import qualified Data.Macaw.Symbolic as MS
 import qualified Data.Parameterized.Context as Ctx
@@ -57,6 +58,7 @@ import           Renovate.BasicBlock
 import           Renovate.Diagnostic
 import           Renovate.ISA
 import           Renovate.Redirect.Monad ( SymbolMap )
+import           Renovate.Recovery.Overlap
 
 import Debug.Trace
 import qualified Text.PrettyPrint.ANSI.Leijen as PP
@@ -97,6 +99,9 @@ data BlockInfo arch = BlockInfo
   , biCFG              :: M.Map (ConcreteAddress arch) (SymbolicCFG arch)
   -- ^ The Crucible CFG for each function (if possible to construct), see
   -- Note [CrucibleCFG]
+  , biOverlap          :: BlockRegions arch
+  -- ^ A structure that lets us determine which blocks in the program overlap
+  -- other blocks in the program (so that we can avoid every trying to rewrite them)
   }
 
 isIncompleteBlockAddress :: BlockInfo arch -> ConcreteAddress arch -> Bool
@@ -167,7 +172,10 @@ cfgFromAddrsWith recovery mem symbols initAddrs memWords = do
   where
     s0 = MC.emptyDiscoveryState mem symbols (recoveryArchInfo recovery)
 
--- There can be overlapping blocks, but there should be no blocks (that differ) that start at the same location
+-- There can be overlapping blocks
+--
+-- We deduplicate identical blocks in this function.  We deal with overlapping
+-- blocks by just never instrumenting them.
 accumulateBlocks :: (MC.MemWidth (MC.ArchAddrWidth arch))
                  => M.Map (MC.ArchSegmentOff arch) (PU.Some (MC.ParsedBlock arch))
                  -> PU.Some (MC.ParsedBlock arch)
@@ -175,9 +183,15 @@ accumulateBlocks :: (MC.MemWidth (MC.ArchAddrWidth arch))
 accumulateBlocks m (PU.Some pb0)
   | Just (PU.Some pb) <- M.lookup (MC.pblockAddr pb0) m
   , MC.blockSize pb0 == MC.blockSize pb = m
-  | Just _ <- M.lookup (MC.pblockAddr pb0) m =
-      error ("Unexpected duplicate (but different) blocks at address: " ++ show (MC.pblockAddr pb0))
   | otherwise = M.insert (MC.pblockAddr pb0) (PU.Some pb0) m
+
+isInMappedMemory mem (PU.Some dfi) =
+  and [ MMP.isExecutable (MC.segmentFlags seg)
+      , MC.msegOffset addr < MC.segmentSize seg
+      ]
+  where
+    addr = MC.discoveredFunAddr dfi
+    seg = MC.msegSegment addr
 
 blockInfo :: (ArchBits arch)
           => Recovery arch
@@ -185,20 +199,20 @@ blockInfo :: (ArchBits arch)
           -> MC.DiscoveryState arch
           -> IO (BlockInfo arch)
 blockInfo recovery mem di = do
-  let blockBuilder = buildBlock (recoveryDis recovery) mem (S.fromList (mapMaybe (concreteFromSegmentOff mem) (F.toList absoluteBlockStarts)))
+  let blockBuilder = buildBlock (recoveryDis recovery) mem
   let macawBlocks = F.foldl' accumulateBlocks M.empty [ PU.Some pb
-                                                      | PU.Some dfi <- M.elems (di L.^. MC.funInfo)
+                                                      | PU.Some dfi <- validFuncs -- M.elems (di L.^. MC.funInfo)
                                                       , pb <- M.elems (dfi L.^. MC.parsedBlocks)
                                                       ]
-  blocks <- catMaybes <$> mapM blockBuilder (M.elems macawBlocks) -- (F.toList absoluteBlockStarts)
+  blocks <- catMaybes <$> mapM blockBuilder (M.elems macawBlocks)
   let addBlock m b = M.insert (basicBlockAddress b) b m
   let blockIndex = F.foldl' addBlock M.empty blocks
   let funcBlocks = M.fromList [ (funcAddr, mapMaybe (\a -> M.lookup a blockIndex) blockAddrs)
-                              | PU.Some dfi <- M.elems (di L.^. MC.funInfo)
+                              | PU.Some dfi <- validFuncs -- M.elems (di L.^. MC.funInfo)
                               , Just funcAddr <- [concreteFromSegmentOff mem (MC.discoveredFunAddr dfi)]
                               , let blockAddrs = mapMaybe (concreteFromSegmentOff mem) (M.keys (dfi L.^. MC.parsedBlocks))
                               ]
-  mcfgs <- T.forM (M.elems (di L.^. MC.funInfo)) $ \(PU.Some dfi) -> do
+  mcfgs <- T.forM validFuncs {- (M.elems (di L.^. MC.funInfo)) -} $ \(PU.Some dfi) -> do
     ior <- IO.newIORef Nothing
     fromMaybe (return Nothing) $ do
       guard (not (isIncompleteFunction dfi))
@@ -206,8 +220,16 @@ blockInfo recovery mem di = do
       cfgGen <- toCFG (recoveryHandleAllocator recovery) dfi
       return (return (Just (funcAddr, SymbolicCFG ior (stToIO cfgGen))))
 
-  -- F.forM_ (M.elems (di L.^. MC.funInfo)) $ \(PU.Some dfi) -> do
-  --   print (PP.pretty dfi)
+  F.forM_ validFuncs {- M.elems (di L.^. MC.funInfo)) -} $ \(PU.Some dfi) -> do
+    let addr = MC.discoveredFunAddr dfi
+    putStrLn ("addr = " ++ show addr)
+    let seg = MC.msegSegment addr
+    putStrLn ("  segment size = " ++ show (MC.segmentSize seg))
+    putStrLn ("  segoff = " ++ show (MC.msegOffset addr))
+    print (MC.msegSegment (MC.discoveredFunAddr dfi))
+    print (PP.pretty dfi)
+    F.forM_ (M.elems (dfi L.^. MC.parsedBlocks)) $ \pb -> do
+      putStrLn ("Reason: " ++ show (MC.blockReason pb))
 
   return BlockInfo { biBlocks = blocks
                    , biFunctionEntries = mapMaybe (concreteFromSegmentOff mem) funcEntries
@@ -215,14 +237,12 @@ blockInfo recovery mem di = do
                    , biDiscoveryFunInfo = infos
                    , biIncomplete = indexIncompleteBlocks mem infos
                    , biCFG = M.fromList (catMaybes mcfgs)
+                   , biOverlap = blockRegions mem di
                    }
   where
-    absoluteBlockStarts = S.fromList [ entry
-                                     | PU.Some dfi <- M.elems (di L.^. MC.funInfo)
-                                     , entry <- M.keys (dfi L.^. MC.parsedBlocks)
-                                     ]
+    validFuncs = filter (isInMappedMemory mem) (M.elems (di L.^. MC.funInfo))
     funcEntries = [ MC.discoveredFunAddr dfi
-                  | PU.Some dfi <- MC.exploredFunctions di
+                  | PU.Some dfi <- validFuncs -- MC.exploredFunctions di
                   ]
     infos = M.fromList [ (concAddr, val)
                        | (segOff, val) <- M.toList (di L.^. MC.funInfo)
@@ -264,18 +284,18 @@ toMacawSymbolMap mem sm = return (M.mapKeys toSegOff sm)
 -- The block starts are obtained from Macaw.  We disassemble from the
 -- start address until we hit a terminator instruction or the start of
 -- another basic block.
+--
+-- FIXME: Keep a record of which macaw blocks we can't translate (for whatever reason)
 buildBlock :: (L.HasCallStack, MC.MemWidth (MC.ArchAddrWidth arch), C.MonadThrow m)
            => (B.ByteString -> Maybe (Int, Instruction arch ()))
            -- ^ The function to pull a single instruction off of the
            -- byte stream; it returns the number of bytes consumed and
            -- the new instruction.
            -> MC.Memory (MC.ArchAddrWidth arch)
-           -> S.Set (ConcreteAddress arch)
-           -- ^ The set of all basic block entry points
            -> PU.Some (MC.ParsedBlock arch)
-           -- ^ The address to start disassembling this block from
+           -- ^ The macaw block to re-disassemble
            -> m (Maybe (ConcreteBlock arch))
-buildBlock dis1 mem absStarts (PU.Some pb)
+buildBlock dis1 mem (PU.Some pb)
   | Just concAddr <- concreteFromSegmentOff mem segAddr = do
       case MC.addrContentsAfter mem (MC.relativeSegmentAddr segAddr) of
         Left err -> C.throwM (MemoryError err)
