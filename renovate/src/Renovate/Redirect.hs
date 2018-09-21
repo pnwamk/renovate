@@ -3,6 +3,8 @@
 module Renovate.Redirect (
   redirect,
   LayoutStrategy(..),
+  LoopStrategy(..),
+  loopStrategy,
   ConcreteBlock,
   SymbolicBlock,
   BasicBlock(..),
@@ -22,7 +24,7 @@ module Renovate.Redirect (
 
 import           Control.Arrow ( (***) )
 import           Control.Monad ( when )
-import           Control.Monad.Trans ( lift )
+import           Control.Monad.Trans ( MonadIO, lift )
 import           Data.Maybe ( catMaybes )
 import qualified Data.Foldable as F
 import qualified Data.List as L
@@ -39,6 +41,8 @@ import           Renovate.ISA
 import           Renovate.Recovery ( BlockInfo, isIncompleteBlockAddress )
 import           Renovate.Redirect.Concretize
 import           Renovate.Redirect.LayoutBlocks.Types ( LayoutStrategy(..)
+                                                      , LoopStrategy(..)
+                                                      , loopStrategy
                                                       , Status(..)
                                                       , ConcretePair(..)
                                                       , SymbolicPair(..)
@@ -59,7 +63,7 @@ import qualified Renovate.Redirect.Monad as RM
 -- The function runs in an arbitrary 'Monad' to allow instrumentors to
 -- carry around their own state.
 --
-redirect :: (Monad m, InstructionConstraints arch)
+redirect :: (MonadIO m, InstructionConstraints arch)
          => ISA arch
          -- ^ Information about the ISA in use
          -> BlockInfo arch
@@ -100,7 +104,7 @@ redirect isa blockInfo textStart textEnd instrumentor mem strat layoutAddr baseS
        when (isIncompleteBlockAddress blockInfo (basicBlockAddress cb)) $ do
          RM.recordIncompleteBlock
        return (SymbolicPair (LayoutPair cb sb Unmodified))
-  concretizedBlocks <- concretize strat layoutAddr transformedBlocks
+  concretizedBlocks <- concretize strat layoutAddr transformedBlocks blockInfo
   RM.recordBlockMap (toBlockMapping concretizedBlocks)
   redirectedBlocks <- redirectOriginalBlocks concretizedBlocks
   let sorter = L.sortBy (comparing basicBlockAddress)

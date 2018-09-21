@@ -13,6 +13,7 @@ module Renovate.Recovery (
   recoverBlocks,
   BlockInfo(..),
   SymbolicCFG,
+  SCFG,
   getSymbolicCFG,
   isIncompleteBlockAddress,
   ArchBits,
@@ -73,7 +74,7 @@ data SymbolicCFG arch = SymbolicCFG (IO.IORef (Maybe (SCFG arch))) (IO (SCFG arc
 --
 -- We have this representation to let us lazily construct CFGs, as we won't
 -- usually need all of them
-getSymbolicCFG :: SymbolicCFG arch -> IO (C.SomeCFG (MS.MacawExt arch) (Ctx.EmptyCtx Ctx.::> MS.ArchRegStruct arch) (MS.ArchRegStruct arch))
+getSymbolicCFG :: SymbolicCFG arch -> IO (SCFG arch)
 getSymbolicCFG (SymbolicCFG r gen) = do
   v0 <- IO.readIORef r
   case v0 of

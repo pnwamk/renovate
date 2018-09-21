@@ -120,6 +120,9 @@ newtype RewriterT arch m a =
             RWS.MonadWriter Diagnostics,
             ET.MonadError E.SomeException)
 
+instance T.MonadIO m => T.MonadIO (RewriterT arch m) where
+  liftIO = RewriterT . T.liftIO
+
 -- | A 'RewriterT' over the 'I.Identity' 'Monad'
 type Rewriter arch a = RewriterT arch I.Identity a
 
