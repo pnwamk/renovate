@@ -52,7 +52,6 @@ import qualified Lang.Crucible.CFG.Extension as C
 import qualified Lang.Crucible.FunctionHandle as C
 import qualified What4.FunctionName as C
 import qualified What4.ProgramLoc as C
-import qualified What4.Interface as WI
 
 import           Renovate.Address
 import           Renovate.BasicBlock

@@ -6,7 +6,7 @@
 -- blocks.
 module Renovate.Redirect.Concretize ( concretize ) where
 
-import           Control.Monad.IO.Class ( MonadIO(liftIO) )
+import           Control.Monad.IO.Class ( MonadIO )
 import qualified Data.Foldable as F
 import qualified Data.Map as M
 import qualified Data.Traversable as T
@@ -16,7 +16,7 @@ import           Data.Maybe ( maybeToList )
 import           Renovate.Address
 import           Renovate.BasicBlock
 import           Renovate.ISA
-import           Renovate.Recovery ( BlockInfo(biCFG), getSymbolicCFG )
+import           Renovate.Recovery ( BlockInfo(biCFG) )
 import           Renovate.Redirect.LayoutBlocks ( layoutBlocks )
 import           Renovate.Redirect.LayoutBlocks.Types ( LayoutPair(..)
                                                       , SymbolicPair(..)
@@ -55,8 +55,7 @@ concretize strat startAddr blocks blockInfo = do
   -- address
   isa <- askISA
   symmap <- askSymbolMap
-  cfgs <- traverse (liftIO . getSymbolicCFG) (biCFG blockInfo)
-  concreteAddresses <- layoutBlocks strat startAddr blocks cfgs
+  concreteAddresses <- layoutBlocks strat startAddr blocks (biCFG blockInfo)
   let concreteAddressMap = M.fromList [ (symbolicAddress (basicBlockAddress sb), ca)
                                       | AddressAssignedPair (LayoutPair _ (AddressAssignedBlock sb ca) _) <- F.toList concreteAddresses
                                       ]

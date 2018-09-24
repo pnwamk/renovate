@@ -14,6 +14,7 @@ import qualified Data.Vector as V
 import qualified Data.Vector.Mutable as MV
 import           Control.Exception ( assert )
 import           Control.Monad
+import           Control.Monad.IO.Class
 import           Control.Monad.ST
 import qualified Data.Foldable as F
 import qualified Data.Functor.Compose as C
@@ -38,7 +39,7 @@ import qualified What4.ProgramLoc as W4
 import           Renovate.Address
 import           Renovate.BasicBlock
 import           Renovate.ISA
-import           Renovate.Recovery (SCFG)
+import           Renovate.Recovery ( SCFG, SymbolicCFG, getSymbolicCFG )
 import           Renovate.Redirect.Monad
 
 import           Renovate.Redirect.LayoutBlocks.Types
@@ -53,19 +54,24 @@ type AddressHeap arch = H.Heap (H.Entry (Down Int) (ConcreteAddress arch))
 --
 -- Right now, we use an inefficient encoding of jumps.  We could do
 -- better later on.
-compactLayout :: forall m t arch. (Monad m, T.Traversable t, InstructionConstraints arch)
+compactLayout :: forall m t arch. (MonadIO m, T.Traversable t, InstructionConstraints arch)
               => ConcreteAddress arch
               -- ^ Address to begin block layout of instrumented blocks
               -> LayoutStrategy
               -> t (SymbolicPair arch)
-              -> M.Map (ConcreteAddress arch) (SCFG arch)
+              -> M.Map (ConcreteAddress arch) (SymbolicCFG arch)
               -> RewriterT arch m [AddressAssignedPair arch]
-compactLayout startAddr strat blocks cfgs = do
+compactLayout startAddr strat blocks cfgs_ = do
   h0 <- case strat of
     -- the parallel strategy is now a special case of compact. In particular,
     -- we avoid allocating the heap and we avoid sorting the input blocklist.
     Parallel _ -> return mempty
     _ -> buildAddressHeap startAddr blocks
+
+  -- Only materialize the CFGs if we absolutely have to.
+  let keepLoops :: Bool
+      keepLoops = loopStrategy strat == KeepLoopBlocksTogether
+  cfgs <- if keepLoops then traverse (liftIO . getSymbolicCFG) cfgs_ else return M.empty
 
   -- We want to keep together blocks that are part of loops. Consequently we
   -- want a way to map each block that's part of a loop to a canonical
@@ -90,9 +96,6 @@ compactLayout startAddr strat blocks cfgs = do
       isPartOfModifiedLoop b = case M.lookup (basicBlockAddress (lpOrig b)) repMap of
         Just rep -> rep `S.member` modifiedLoops
         Nothing -> False
-
-      keepLoops :: Bool
-      keepLoops = loopStrategy strat == KeepLoopBlocksTogether
 
   -- Augment all symbolic blocks such that fallthrough behavior is explicitly
   -- represented with symbolic unconditional jumps.
