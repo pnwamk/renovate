@@ -110,11 +110,12 @@ isIncompleteBlockAddress bi a = S.member a (biIncomplete bi)
 analyzeDiscoveredFunctions :: (ArchBits arch)
                            => Recovery arch
                            -> MC.Memory (MC.ArchAddrWidth arch)
+                           -> (ConcreteAddress arch, ConcreteAddress arch)
                            -> MC.DiscoveryState arch
                            -> Int
                            -- ^ Iteration count
                            -> IO (MC.DiscoveryState arch)
-analyzeDiscoveredFunctions recovery mem info !iterations =
+analyzeDiscoveredFunctions recovery mem textAddrRange info !iterations =
   case M.lookupMin (info L.^. MC.unexploredFunctions) of
     Nothing -> return info
     Just (addr, rsn) -> do
@@ -123,10 +124,10 @@ analyzeDiscoveredFunctions recovery mem info !iterations =
       case recoveryFuncCallback recovery of
         Just (freq, fcb)
           | iterations `mod` freq == 0 -> do
-              bi <- blockInfo recovery mem info'
+              bi <- blockInfo recovery mem textAddrRange info'
               fcb addr bi
         _ -> return ()
-      analyzeDiscoveredFunctions recovery mem info' (iterations + 1)
+      analyzeDiscoveredFunctions recovery mem textAddrRange info' (iterations + 1)
 
 data ArchVals arch =
   ArchVals { archFunctions :: MS.MacawSymbolicArchFunctions arch
@@ -160,15 +161,16 @@ toCFG halloc dfi = do
 cfgFromAddrsWith :: (ArchBits arch)
                  => Recovery arch
                  -> MC.Memory (MC.ArchAddrWidth arch)
+                 -> (ConcreteAddress arch, ConcreteAddress arch)
                  -> MC.AddrSymMap (MC.ArchAddrWidth arch)
                  -> [MC.ArchSegmentOff arch]
                  -> [(MC.ArchSegmentOff arch, MC.ArchSegmentOff arch)]
                  -> IO (MC.DiscoveryState arch)
-cfgFromAddrsWith recovery mem symbols initAddrs memWords = do
+cfgFromAddrsWith recovery mem textAddrRange symbols initAddrs memWords = do
   let s1 = MC.markAddrsAsFunction MC.InitAddr initAddrs s0
-  s2 <- analyzeDiscoveredFunctions recovery mem s1 0
+  s2 <- analyzeDiscoveredFunctions recovery mem textAddrRange s1 0
   let s3 = MC.exploreMemPointers memWords s2
-  analyzeDiscoveredFunctions recovery mem s3 0
+  analyzeDiscoveredFunctions recovery mem textAddrRange s3 0
   where
     s0 = MC.emptyDiscoveryState mem symbols (recoveryArchInfo recovery)
 
@@ -193,16 +195,31 @@ isInMappedMemory mem (PU.Some dfi) =
     addr = MC.discoveredFunAddr dfi
     seg = MC.msegSegment addr
 
+addrInRange :: (MC.MemWidth (MC.ArchAddrWidth arch))
+            => MC.Memory (MC.ArchAddrWidth arch)
+            -> (ConcreteAddress arch, ConcreteAddress arch)
+            -> MC.ArchSegmentOff arch
+            -> Bool
+addrInRange mem (textStart, textEnd) addr = fromMaybe False $ do
+  absAddr <- MC.msegAddr addr
+  soStart <- MC.msegAddr =<< concreteAsSegmentOff mem textStart
+  soEnd <- MC.msegAddr =<< concreteAsSegmentOff mem textEnd
+  return (absAddr >= soStart && absAddr < soEnd)
+
+-- FIXME We need to include the range of valid code here (derived from the text section) so that we can
+-- exclude invalid code discovered by macaw due to e.g., the TOC in PowerPC binaries.
 blockInfo :: (ArchBits arch)
           => Recovery arch
           -> MC.Memory (MC.RegAddrWidth (MC.ArchReg arch))
+          -> (ConcreteAddress arch, ConcreteAddress arch)
           -> MC.DiscoveryState arch
           -> IO (BlockInfo arch)
-blockInfo recovery mem di = do
+blockInfo recovery mem textAddrRange di = do
   let blockBuilder = buildBlock (recoveryDis recovery) mem
   let macawBlocks = F.foldl' accumulateBlocks M.empty [ PU.Some pb
                                                       | PU.Some dfi <- validFuncs -- M.elems (di L.^. MC.funInfo)
                                                       , pb <- M.elems (dfi L.^. MC.parsedBlocks)
+                                                      , addrInRange mem textAddrRange (MC.pblockAddr pb)
                                                       ]
   blocks <- catMaybes <$> mapM blockBuilder (M.elems macawBlocks)
   let addBlock m b = M.insert (basicBlockAddress b) b m
@@ -263,11 +280,12 @@ recoverBlocks :: (ArchBits arch)
               -> MC.Memory (MC.ArchAddrWidth arch)
               -> SymbolMap arch
               -> NEL.NonEmpty (MC.MemSegmentOff (MC.ArchAddrWidth arch))
+              -> (ConcreteAddress arch, ConcreteAddress arch)
               -> IO (BlockInfo arch)
-recoverBlocks recovery mem symmap entries = do
+recoverBlocks recovery mem symmap entries textAddrRange = do
   sam <- toMacawSymbolMap mem symmap
-  di <- cfgFromAddrsWith recovery mem sam (F.toList entries) []
-  blockInfo recovery mem di
+  di <- cfgFromAddrsWith recovery mem textAddrRange sam (F.toList entries) []
+  blockInfo recovery mem textAddrRange di
 
 toMacawSymbolMap :: (MC.MemWidth (MC.ArchAddrWidth arch)) => MC.Memory (MC.ArchAddrWidth arch) -> SymbolMap arch -> IO (MC.AddrSymMap (MC.ArchAddrWidth arch))
 toMacawSymbolMap mem sm = return (M.mapKeys toSegOff sm)
