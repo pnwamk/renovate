@@ -30,11 +30,29 @@ import qualified Data.Macaw.CFG as MM
 --
 -- The 'Word64' value of the 'SymbolicAddress' is a meaningless nonce,
 -- a unique identifier.
-newtype SymbolicAddress = SymbolicAddress Word64
-                        deriving (Eq, Ord, Show)
+--
+-- FIXME: During the symbolization (i.e., relocation lifting) step, we replace
+-- jump targets with their symbolic equivalents to allow us to move code around
+-- and then re-compute offsets.  The current setup assumes that we'll always be
+-- able to find that symbolic target for every jump.  That isn't true: we might
+-- not have a symbolic target at all if the jump is outside of the text section
+-- (since we don't analyze anything outside of the text section).
+--
+-- The fix is to make 'SymbolicAddress' an ADT where one case is the current
+-- SymbolicAddress, but the other is a 'ConcreteAddress' that we know won't
+-- change.  When we fix everything up, we'll still need to fix up jumps to those
+-- addresses, but it will simply be a relative computation between the new
+-- address of the jump source and the original jump target (instead of between
+-- two new addresses).
+data SymbolicAddress arch = SymbolicAddress Word64
+                          | StableAddress (ConcreteAddress arch)
+                          deriving (Eq, Ord)
 
-instance PD.Pretty SymbolicAddress where
+deriving instance (MM.MemWidth (MM.ArchAddrWidth arch)) => Show (SymbolicAddress arch)
+
+instance (MM.MemWidth (MM.ArchAddrWidth arch)) => PD.Pretty (SymbolicAddress arch) where
   pretty (SymbolicAddress a) = "0x" PD.<> PD.pretty (N.showHex a "")
+  pretty (StableAddress a) = PD.pretty a
 
 -- | The type of concrete addresses that can be laid out in memory
 --

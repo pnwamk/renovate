@@ -57,8 +57,8 @@ symbolizeBasicBlocks concreteBlocks = do
 -- See Note [Jump Promotion]
 symbolizeJumps :: forall arch m
                 . (Monad m, InstructionConstraints arch)
-               => M.Map (ConcreteAddress arch) SymbolicAddress
-               -> (ConcreteBlock arch, SymbolicAddress)
+               => M.Map (ConcreteAddress arch) (SymbolicAddress arch)
+               -> (ConcreteBlock arch, SymbolicAddress arch)
                -> RewriterT arch m (ConcreteBlock arch, SymbolicBlock arch)
 symbolizeJumps symAddrMap (cb, symAddr) = do
   isa <- askISA
@@ -97,14 +97,14 @@ symbolizeJumps symAddrMap (cb, symAddr) = do
     lookupSymbolicAddress isa (i, addr) target =
       case M.lookup target symAddrMap of
         Just saddr -> return saddr
-        Nothing -> do
+        Nothing -> return (StableAddress target)
           -- traceM ("target: " ++ show target)
           -- traceM ("symAddrs:  \n" ++ show (PD.vcat ((\(k, a) -> PD.pretty (show k) PD.<+> PD.pretty "=>" PD.<+> PD.pretty a) <$>
           --                                       (M.toList symAddrMap))))
-          let err :: Diagnostic
-              err = NoSymbolicAddressForTarget (printf "%s:%s" (show addr) (isaPrettyInstruction isa i)) target "symbolizeJumps"
-          logDiagnostic err
-          throwError err
+          -- let err :: Diagnostic
+          --     err = NoSymbolicAddressForTarget (printf "%s:%s" (show addr) (isaPrettyInstruction isa i)) target "symbolizeJumps"
+          -- logDiagnostic err
+          -- throwError err
 
 {- Note [Jump Promotion]
 
