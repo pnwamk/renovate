@@ -6,16 +6,20 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ElfEdit as E
 import           Data.Functor.Const ( Const(..) )
+import           Data.Monoid ((<>))
 import qualified Options.Applicative as O
 import qualified System.Exit as IO
 
 import qualified Data.Macaw.BinaryLoader as MBL
 import           Data.Macaw.BinaryLoader.X86 ()
 import qualified Data.Parameterized.NatRepr as NR
+import qualified Lang.Crucible.FunctionHandle as C
 
 import qualified Renovate as R
 import qualified Renovate.Arch.PPC as RP
 import qualified Renovate.Arch.X86_64 as RX
+
+import           Prelude hiding ((<>))
 
 data Options = Options { oInput :: FilePath
                        , oOutput :: FilePath
@@ -48,6 +52,7 @@ mainWithOptions o = do
                 , (R.PPC64, R.SomeConfig (NR.knownNat @64) MBL.Elf64Repr (RP.config64 analyze rewrite))
                 , (R.X86_64, R.SomeConfig (NR.knownNat @64) MBL.Elf64Repr (RX.config analyze rewrite))
                 ]
+  hdlAlloc <- C.newHandleAllocator
   case E.parseElf bytes of
     E.ElfHeaderError _ err -> do
       putStrLn err
@@ -57,14 +62,14 @@ mainWithOptions o = do
         [] -> return ()
         _ -> print errs
       R.withElfConfig (E.Elf32 e32) configs $ \rc e loadedBinary -> do
-        (e', _, _) <- R.rewriteElf rc e loadedBinary R.Parallel
+        (e', _, _) <- R.rewriteElf rc hdlAlloc e loadedBinary R.Parallel
         LBS.writeFile (oOutput o) (E.renderElf e')
     E.Elf64Res errs e64 -> do
       case errs of
         [] -> return ()
         _ -> print errs
       R.withElfConfig (E.Elf64 e64) configs $ \rc e loadedBinary -> do
-        (e', _, _) <- R.rewriteElf rc e loadedBinary R.Parallel
+        (e', _, _) <- R.rewriteElf rc hdlAlloc e loadedBinary R.Parallel
         LBS.writeFile (oOutput o) (E.renderElf e')
 
 analyze :: R.AnalyzeEnv arch -> MBL.LoadedBinary arch binFmt -> IO (Const () arch)
