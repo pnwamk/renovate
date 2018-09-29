@@ -256,6 +256,9 @@ modifyCurrentELF k = do
   S.modify' $ \s -> s { _riELF = elf' }
   return res
 
+-- | Compute the starting and ending address (address range) of an ELF section
+--
+-- FIXME: It would be nice to bundle the return value up in an ADT instead of a pair
 sectionAddressRange :: (MM.MemWidth (MM.ArchAddrWidth arch), Integral a)
                     => E.ElfSection a
                     -> (RE.ConcreteAddress arch, RE.ConcreteAddress arch)
@@ -345,14 +348,12 @@ doRewrite cfg hdlAlloc loadedBinary symmap strat = do
       -- to a page of space to maintain alignment.
       dataAddr = RA.concreteFromAbsolute (fromIntegral (rcDataLayoutBase cfg))
       textSectionRange = sectionAddressRange textSection
-      -- textSectionStartAddr = RA.concreteFromAbsolute (fromIntegral (E.elfSectionAddr textSection))
-      -- textSectionEndAddr = RA.addressAddOffset textSectionStartAddr (fromIntegral ((E.elfSectionSize textSection)))
 
   ( analysisResult
     , overwrittenBytes
     , instrumentedBytes
     , mNewData
-    , newSyms ) <- instrumentTextSection cfg hdlAlloc loadedBinary textSectionRange -- textSectionStartAddr textSectionEndAddr
+    , newSyms ) <- instrumentTextSection cfg hdlAlloc loadedBinary textSectionRange
                                        (E.elfSectionData textSection) strat layoutAddr dataAddr symmap
 
   riOriginalTextSize L..= fromIntegral (B.length overwrittenBytes)

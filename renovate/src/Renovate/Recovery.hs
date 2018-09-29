@@ -43,7 +43,6 @@ import qualified Data.Traversable as T
 import qualified Data.Macaw.Architecture.Info as MC
 import qualified Data.Macaw.CFG as MC
 import qualified Data.Macaw.Discovery as MC
-import qualified Data.Macaw.Memory.Permissions as MMP
 import qualified Data.Macaw.Types as MC
 import qualified Data.Macaw.Symbolic as MS
 import qualified Data.Parameterized.Context as Ctx
@@ -62,9 +61,6 @@ import           Renovate.Diagnostic
 import           Renovate.ISA
 import           Renovate.Redirect.Monad ( SymbolMap )
 import           Renovate.Recovery.Overlap
-
-import Debug.Trace
-import qualified Text.PrettyPrint.ANSI.Leijen as PP
 
 type ArchBits arch = (  MC.ArchConstraints arch,
                         MC.RegisterInfo (MC.ArchReg arch),
@@ -211,14 +207,6 @@ accumulateBlocks m (PU.Some pb0)
   , MC.blockSize pb0 == MC.blockSize pb = m
   | otherwise = M.insert (MC.pblockAddr pb0) (PU.Some pb0) m
 
-isInMappedMemory mem (PU.Some dfi) =
-  and [ MMP.isExecutable (MC.segmentFlags seg)
-      , MC.msegOffset addr < MC.segmentSize seg
-      ]
-  where
-    addr = MC.discoveredFunAddr dfi
-    seg = MC.msegSegment addr
-
 addrInRange :: (MC.MemWidth (MC.ArchAddrWidth arch))
             => MC.Memory (MC.ArchAddrWidth arch)
             -> (ConcreteAddress arch, ConcreteAddress arch)
@@ -230,8 +218,6 @@ addrInRange mem (textStart, textEnd) addr = fromMaybe False $ do
   soEnd <- MC.msegAddr =<< concreteAsSegmentOff mem textEnd
   return (absAddr >= soStart && absAddr < soEnd)
 
--- FIXME We need to include the range of valid code here (derived from the text section) so that we can
--- exclude invalid code discovered by macaw due to e.g., the TOC in PowerPC binaries.
 blockInfo :: (ArchBits arch)
           => Recovery arch
           -> MC.Memory (MC.RegAddrWidth (MC.ArchReg arch))
@@ -241,7 +227,7 @@ blockInfo :: (ArchBits arch)
 blockInfo recovery mem textAddrRange di = do
   let blockBuilder = buildBlock (recoveryDis recovery) mem
   let macawBlocks = F.foldl' accumulateBlocks M.empty [ PU.Some pb
-                                                      | PU.Some dfi <- validFuncs -- M.elems (di L.^. MC.funInfo)
+                                                      | PU.Some dfi <- validFuncs
                                                       , pb <- M.elems (dfi L.^. MC.parsedBlocks)
                                                       , addrInRange mem textAddrRange (MC.pblockAddr pb)
                                                       ]
@@ -249,11 +235,11 @@ blockInfo recovery mem textAddrRange di = do
   let addBlock m b = M.insert (basicBlockAddress b) b m
   let blockIndex = F.foldl' addBlock M.empty blocks
   let funcBlocks = M.fromList [ (funcAddr, mapMaybe (\a -> M.lookup a blockIndex) blockAddrs)
-                              | PU.Some dfi <- validFuncs -- M.elems (di L.^. MC.funInfo)
+                              | PU.Some dfi <- validFuncs
                               , Just funcAddr <- [concreteFromSegmentOff mem (MC.discoveredFunAddr dfi)]
                               , let blockAddrs = mapMaybe (concreteFromSegmentOff mem) (M.keys (dfi L.^. MC.parsedBlocks))
                               ]
-  mcfgs <- T.forM validFuncs {- (M.elems (di L.^. MC.funInfo)) -} $ \(PU.Some dfi) -> do
+  mcfgs <- T.forM validFuncs $ \(PU.Some dfi) -> do
     regIor <- IO.newIORef Nothing
     cfgIor <- IO.newIORef Nothing
     fromMaybe (return Nothing) $ do
@@ -267,17 +253,6 @@ blockInfo recovery mem textAddrRange di = do
 
   let cfgPairs = M.fromList (catMaybes mcfgs)
 
-  F.forM_ validFuncs {- M.elems (di L.^. MC.funInfo)) -} $ \(PU.Some dfi) -> do
-    let addr = MC.discoveredFunAddr dfi
-    putStrLn ("addr = " ++ show addr)
-    let seg = MC.msegSegment addr
-    putStrLn ("  segment size = " ++ show (MC.segmentSize seg))
-    putStrLn ("  segoff = " ++ show (MC.msegOffset addr))
-    print (MC.msegSegment (MC.discoveredFunAddr dfi))
-    print (PP.pretty dfi)
-    F.forM_ (M.elems (dfi L.^. MC.parsedBlocks)) $ \pb -> do
-      putStrLn ("Reason: " ++ show (MC.blockReason pb))
-
   return BlockInfo { biBlocks = blocks
                    , biFunctionEntries = mapMaybe (concreteFromSegmentOff mem) funcEntries
                    , biFunctionBlocks = funcBlocks
@@ -288,9 +263,9 @@ blockInfo recovery mem textAddrRange di = do
                    , biOverlap = blockRegions mem di
                    }
   where
-    validFuncs = filter (isInMappedMemory mem) (M.elems (di L.^. MC.funInfo))
+    validFuncs = M.elems (di L.^. MC.funInfo)
     funcEntries = [ MC.discoveredFunAddr dfi
-                  | PU.Some dfi <- validFuncs -- MC.exploredFunctions di
+                  | PU.Some dfi <- validFuncs
                   ]
     infos = M.fromList [ (concAddr, val)
                        | (segOff, val) <- M.toList (di L.^. MC.funInfo)
@@ -306,6 +281,24 @@ data Recovery arch =
            , recoveryFuncCallback :: Maybe (Int, MC.ArchSegmentOff arch -> BlockInfo arch -> IO ())
            }
 
+-- | Use macaw to discover code in a binary
+--
+-- > recoverBlocks recovery mem symmap entries textAddrRange
+--
+-- Performs code discover for a given memory image (@mem@) from a set of entry
+-- points (@entries@).  Recovered functions are mapped to symbol table entries
+-- (@symmap@) if possible.
+--
+-- The @textAddrRange@ parameter is used to constrain code recovery to a desired
+-- range (usually the text section of the binary).  Macaw aggressively explores
+-- all addresses encountered that live in an executable segment of memory.  This
+-- is normally fine and a decent heuristic for dealing with code only reachable
+-- via indirect call; however, on PowerPC it is problematic, as the Table of
+-- Contents (TOC) is mapped in executable memory.  This causes macaw to decode
+-- much of the TOC as code, most of which is not really valid code.  The code
+-- that attempts to make code relocatable (the symbolization phase) fails badly
+-- in this case.  To avoid these failures, we constrain our code recovery to the
+-- text section.
 recoverBlocks :: (ArchBits arch)
               => Recovery arch
               -> MC.Memory (MC.ArchAddrWidth arch)

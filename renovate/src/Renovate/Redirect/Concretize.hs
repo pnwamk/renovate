@@ -150,8 +150,6 @@ mapJumpAddress concreteAddressMap (tagged, insnAddr) = do
             throwError err
           Just insn -> return insn
       | otherwise -> do
-          -- FIXME: If we don't find a jump target in the map, the target
-          -- address (symAddr) was actually outside of the text section
           let err :: Diagnostic
               err = NoConcreteAddressForSymbolicTarget symAddr "concretizeJumps"
           logDiagnostic err

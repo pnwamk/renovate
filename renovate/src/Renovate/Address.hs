@@ -28,22 +28,15 @@ import qualified Data.Macaw.CFG as MM
 -- relocated.  They will automatically be concretized when blocks are
 -- laid out.
 --
--- The 'Word64' value of the 'SymbolicAddress' is a meaningless nonce,
--- a unique identifier.
+-- The 'Word64' value of the 'SymbolicAddress' is a unique identifier.
 --
--- FIXME: During the symbolization (i.e., relocation lifting) step, we replace
--- jump targets with their symbolic equivalents to allow us to move code around
--- and then re-compute offsets.  The current setup assumes that we'll always be
--- able to find that symbolic target for every jump.  That isn't true: we might
--- not have a symbolic target at all if the jump is outside of the text section
--- (since we don't analyze anything outside of the text section).
---
--- The fix is to make 'SymbolicAddress' an ADT where one case is the current
--- SymbolicAddress, but the other is a 'ConcreteAddress' that we know won't
--- change.  When we fix everything up, we'll still need to fix up jumps to those
--- addresses, but it will simply be a relative computation between the new
--- address of the jump source and the original jump target (instead of between
--- two new addresses).
+--  * 'SymbolicAddress' denotes a referenced address to a code entity that
+--    could be relocated.  In this case, both the source of the reference and
+--    the target of the reference can be relocated
+--  * 'StableAddress' denotes a reference to a code entity that cannot be relocated
+--    (e.g., because it is outside of the text section).  In this case, the source
+--    of the reference may be relocated (so a relative offset may need to be recomputed)
+--    but the target of the reference will not be relocated.
 data SymbolicAddress arch = SymbolicAddress Word64
                           | StableAddress (ConcreteAddress arch)
                           deriving (Eq, Ord)
