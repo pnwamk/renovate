@@ -132,7 +132,15 @@ mapJumpAddress concreteAddressMap (tagged, insnAddr) = do
   isa <- askISA
   mem <- askMem
   case symbolicTarget tagged of
-    Just symAddr
+    Just (StableAddress concAddr) ->
+      case isaModifyJumpTarget isa (isaConcretizeAddresses isa mem insnAddr i) insnAddr concAddr of
+        Nothing -> do
+          let err :: Diagnostic
+              err = InstructionIsNotJump (show i)
+          logDiagnostic err
+          throwError err
+        Just insn -> return insn
+    Just symAddr@(SymbolicAddress _)
       | Just concAddr <- M.lookup symAddr concreteAddressMap ->
         case isaModifyJumpTarget isa (isaConcretizeAddresses isa mem insnAddr i) insnAddr concAddr of
           Nothing -> do
@@ -142,6 +150,8 @@ mapJumpAddress concreteAddressMap (tagged, insnAddr) = do
             throwError err
           Just insn -> return insn
       | otherwise -> do
+          -- FIXME: If we don't find a jump target in the map, the target
+          -- address (symAddr) was actually outside of the text section
           let err :: Diagnostic
               err = NoConcreteAddressForSymbolicTarget symAddr "concretizeJumps"
           logDiagnostic err
