@@ -230,7 +230,7 @@ checkedOverlappingAssemble b overlays = do
     -- ensure that nobody was doing any rewriting)
     let overlayEnd = blockEndAddress isa overlay
     assertM (basicBlockAddress overlay > basicBlockAddress b)
-    assertM (overlayEnd == blockEnd)
+    assertM (overlayEnd <= blockEnd)
 
   baseBytes <- assembleBlock b
   appendTextBytes baseBytes
