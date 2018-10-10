@@ -822,8 +822,8 @@ instrumentTextSection cfg hdlAlloc loadedBinary textAddrRange@(textSectionStartA
             , aeSymbolicBlockMap = symbolicBlockMap
             , aeRunRewriteM = RW.runRewriteM env newGlobalBase }
       analysisResult <- IO.liftIO $ analysis analyzeEnv loadedBinary
-      let ((eBlocks, r1), info) = RW.runRewriteM env newGlobalBase . RE.resumeRewriterT isa mem symmap r0 $ do
-            RE.redirect isa blockInfo textSectionStartAddr textSectionEndAddr (rewriter analysisResult loadedBinary) mem strat layoutAddr baseSymBlocks
+      ((eBlocks, r1), info) <- IO.liftIO . RW.runRewriteMT env newGlobalBase . RE.resumeRewriterT isa mem symmap r0 $ do
+            RE.redirect isa blockInfo textSectionStartAddr textSectionEndAddr (RW.hoist . rewriter analysisResult loadedBinary) mem strat layoutAddr baseSymBlocks
       (overwrittenBlocks, instrumentationBlocks) <- extractOrThrowRewriterResult eBlocks r1
 
       let s1 = RE.rrState r1

@@ -3,13 +3,16 @@
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE UndecidableInstances #-}
 module Renovate.Rewrite (
+  RewriteMT,
   RewriteM,
   RewriteEnv(..),
   RewriteInfo(..),
   RewriteSite(..),
   BlockCFGIndex,
   mkRewriteEnv,
+  runRewriteMT,
   runRewriteM,
+  hoist,
   lookupBlockCFG,
   lookupEntryAddress,
   newGlobalVar,
@@ -20,6 +23,7 @@ module Renovate.Rewrite (
 
 import qualified GHC.Err.Located as L
 
+import qualified Control.Monad.Identity as I
 import qualified Control.Monad.RWS.Strict as RWS
 import qualified Data.Foldable as F
 import qualified Data.Map.Strict as M
@@ -76,12 +80,18 @@ data RewriteEnv arch =
 type BlockCFGIndex arch = M.Map (A.ConcreteAddress arch) (S.Set (FR.FunctionCFG arch))
 
 -- | A monadic environment for binary rewriting
-newtype RewriteM arch a = RewriteM { unRewriteM :: RWS.RWS (RewriteEnv arch) () (RewriteInfo arch) a }
+newtype RewriteMT arch m a = RewriteM { unRewriteM :: RWS.RWST (RewriteEnv arch) () (RewriteInfo arch) m a }
   deriving (Applicative,
             Functor,
             Monad,
             RWS.MonadReader (RewriteEnv arch),
-            RWS.MonadState (RewriteInfo arch))
+            RWS.MonadState (RewriteInfo arch),
+            RWS.MonadIO)
+
+type RewriteM arch = RewriteMT arch I.Identity
+
+hoist :: Monad m => RewriteM arch a -> RewriteMT arch m a
+hoist (RewriteM act) = RewriteM (RWS.mapRWST (return . I.runIdentity) act)
 
 -- | Make a mapping from block addresses to their CFGs.
 mkBlockCFGIndex :: [FR.FunctionCFG arch] -> BlockCFGIndex arch
@@ -116,9 +126,19 @@ runRewriteM :: RewriteEnv arch
             -> RewriteM arch a
             -- ^ The rewriting action to run
             -> (a, RewriteInfo arch)
-runRewriteM env newGlobalBase i = (res, st)
+runRewriteM env newGlobalBase = I.runIdentity . runRewriteMT env newGlobalBase
+
+runRewriteMT :: Monad m
+             => RewriteEnv arch
+             -> A.ConcreteAddress arch
+             -- ^ The address to start allocating new global variables at
+             -> RewriteMT arch m a
+             -- ^ The rewriting action to run
+             -> m (a, RewriteInfo arch)
+runRewriteMT env newGlobalBase i = ignoreEmptyWriter <$> resultAction
   where
-    (res, st, _) = RWS.runRWS (unRewriteM i) env emptyInfo
+    ignoreEmptyWriter (res, st, _) = (res, st)
+    resultAction = RWS.runRWST (unRewriteM i) env emptyInfo
     emptyInfo = RewriteInfo { infoSites = []
                             , newGlobals = M.empty
                             , nextGlobalAddress = newGlobalBase

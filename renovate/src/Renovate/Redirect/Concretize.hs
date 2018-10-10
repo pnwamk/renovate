@@ -6,6 +6,7 @@
 -- blocks.
 module Renovate.Redirect.Concretize ( concretize ) where
 
+import           Control.Monad.IO.Class ( MonadIO )
 import qualified Data.Foldable as F
 import qualified Data.Map as M
 import qualified Data.Traversable as T
@@ -15,6 +16,7 @@ import           Data.Maybe ( maybeToList )
 import           Renovate.Address
 import           Renovate.BasicBlock
 import           Renovate.ISA
+import           Renovate.Recovery ( BlockInfo(biCFG) )
 import           Renovate.Redirect.LayoutBlocks ( layoutBlocks )
 import           Renovate.Redirect.LayoutBlocks.Types ( LayoutPair(..)
                                                       , SymbolicPair(..)
@@ -41,18 +43,19 @@ import           Renovate.Redirect.Monad
 -- Note that blocks have to be laid out in order; using M.toList is
 -- sufficient to sort by original address, which maintains the order
 -- invariant.
-concretize :: (Monad m, T.Traversable t, InstructionConstraints arch)
+concretize :: (MonadIO m, T.Traversable t, InstructionConstraints arch)
            => LayoutStrategy
            -> ConcreteAddress arch
            -- ^ The start address of the concretized (instrumented) blocks
            -> t (SymbolicPair arch)
+           -> BlockInfo arch
            -> RewriterT arch m [ConcretePair arch]
-concretize strat startAddr blocks = do
+concretize strat startAddr blocks blockInfo = do
   -- First, build up a mapping of symbolic address to new concrete
   -- address
   isa <- askISA
   symmap <- askSymbolMap
-  concreteAddresses <- layoutBlocks strat startAddr blocks
+  concreteAddresses <- layoutBlocks strat startAddr blocks (biCFG blockInfo)
   let concreteAddressMap = M.fromList [ (symbolicAddress (basicBlockAddress sb), ca)
                                       | AddressAssignedPair (LayoutPair _ (AddressAssignedBlock sb ca) _) <- F.toList concreteAddresses
                                       ]

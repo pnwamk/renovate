@@ -21,6 +21,8 @@ module Renovate
   C.SomeConfig(..),
   C.TrivialConfigConstraint,
   LB.LayoutStrategy(..),
+  LB.LoopStrategy(..),
+  LB.loopStrategy,
   LB.CompactOrdering(..),
   C.RenovateConfig(..),
   Recovery.ArchInfo(..),
