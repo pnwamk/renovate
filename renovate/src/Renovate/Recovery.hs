@@ -216,8 +216,13 @@ addrInRange :: (MC.MemWidth (MC.ArchAddrWidth arch))
 addrInRange mem (textStart, textEnd) addr = fromMaybe False $ do
   absAddr <- MC.msegAddr addr
   soStart <- MC.msegAddr =<< concreteAsSegmentOff mem textStart
-  soEnd <- MC.msegAddr =<< concreteAsSegmentOff mem textEnd
-  return (absAddr >= soStart && absAddr < soEnd)
+  soLast <- MC.msegAddr =<< concreteAsSegmentOff mem textLast
+  return (absAddr >= soStart && absAddr <= soLast)
+  where
+  -- The address we store for the end of the text section is the first byte
+  -- that's out of bounds for the text section. We don't want to try to call
+  -- concreteAsSegmentOff on something that's out of bounds.
+  textLast = addressAddOffset textEnd (-1)
 
 blockInfo :: (ArchBits arch)
           => Recovery arch
