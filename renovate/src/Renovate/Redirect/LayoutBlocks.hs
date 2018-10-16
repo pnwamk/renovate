@@ -13,7 +13,7 @@ import           Data.Map (Map)
 import qualified Data.Traversable as T
 
 import           Renovate.Address
-import           Renovate.BasicBlock ( InstructionConstraints )
+import           Renovate.BasicBlock ( InstructionConstraints, ConcreteBlock )
 import           Renovate.Recovery ( SymbolicCFG )
 import           Renovate.Redirect.Monad
 import           Renovate.Redirect.LayoutBlocks.Compact ( compactLayout )
@@ -34,6 +34,6 @@ layoutBlocks :: (MonadIO m, T.Traversable t, InstructionConstraints arch)
              -- ^ Address to begin block layout of instrumented blocks
              -> t (SymbolicPair arch)
              -> Map (ConcreteAddress arch) (SymbolicCFG arch)
-             -> RewriterT arch m [AddressAssignedPair arch]
+             -> RewriterT arch m ([AddressAssignedPair arch], [ConcreteBlock arch])
 layoutBlocks strat startAddr blocks cfgs =
   compactLayout startAddr strat blocks cfgs

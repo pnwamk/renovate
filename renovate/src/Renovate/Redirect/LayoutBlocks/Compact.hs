@@ -54,13 +54,17 @@ type AddressHeap arch = H.Heap (H.Entry (Down Int) (ConcreteAddress arch))
 --
 -- Right now, we use an inefficient encoding of jumps.  We could do
 -- better later on.
+--
+-- Returns blocks that are paired up with their originals, and some new blocks
+-- (filled with ISA-specific padding) that we'd like the assembler to insert
+-- for us that don't correspond to any existing code from the input blocks.
 compactLayout :: forall m t arch. (MonadIO m, T.Traversable t, InstructionConstraints arch)
               => ConcreteAddress arch
               -- ^ Address to begin block layout of instrumented blocks
               -> LayoutStrategy
               -> t (SymbolicPair arch)
               -> M.Map (ConcreteAddress arch) (SymbolicCFG arch)
-              -> RewriterT arch m [AddressAssignedPair arch]
+              -> RewriterT arch m ([AddressAssignedPair arch], [ConcreteBlock arch])
 compactLayout startAddr strat blocks cfgs_ = do
   h0 <- case strat of
     -- the parallel strategy is now a special case of compact. In particular,
@@ -129,7 +133,23 @@ compactLayout startAddr strat blocks cfgs_ = do
 
   -- Allocate an address for each block (falling back to startAddr if the heap
   -- can't provide a large enough space).
-  symBlockAddrs <- allocateSymbolicBlockAddresses startAddr h0 sortedBlocks
+  (h1, symBlockAddrs) <- allocateSymbolicBlockAddresses startAddr h0 sortedBlocks
+
+  -- Overwrite any leftover space with ISA-specific padding. This is not,
+  -- strictly speaking, necessary; without it, the assembler will take bytes
+  -- from the original text section as padding instead. But it is safer to
+  -- catch jumps that our tool didn't know about by landing at a halt
+  -- instruction, when that is possible.
+  h2 <- case strat of
+    -- In the parallel layout, we don't use any space reclaimed by redirecting
+    -- things, so we should overwrite it all with padding.
+    Parallel _ -> buildAddressHeap startAddr blocks
+    _ -> return h1
+
+  let paddingBlocks :: [ConcreteBlock arch]
+      paddingBlocks = [ BasicBlock (isaMakePadding isa (fromIntegral size)) addr
+                      | H.Entry (Down size) addr <- H.toUnsortedList h2
+                      ]
 
   -- Traverse the original container and update it with the addresses allocated
   -- to each symbolic block.  This will have an irrefutable pattern match that
@@ -138,7 +158,9 @@ compactLayout startAddr strat blocks cfgs_ = do
   -- Note that we are assigning addresses to blocks', which has augmented the
   -- symbolic blocks with additional jumps to preserve fallthrough behavior.
   -- That is critical.
-  T.traverse (assignConcreteAddress symBlockAddrs) (F.toList blocks' ++ unmodifiedBlocks)
+  assignedPairs <- T.traverse (assignConcreteAddress symBlockAddrs) (F.toList blocks' ++ unmodifiedBlocks)
+
+  return (assignedPairs, paddingBlocks)
   where
     bySize isa mem = Down . sum . map (symbolicBlockSize isa mem startAddr)
 
@@ -257,12 +279,12 @@ allocateSymbolicBlockAddresses :: (Monad m, MM.MemWidth (MM.ArchAddrWidth arch))
                                => ConcreteAddress arch
                                -> AddressHeap arch
                                -> [[SymbolicBlock arch]]
-                               -> RewriterT arch m (M.Map (SymbolicInfo arch) (ConcreteAddress arch))
+                               -> RewriterT arch m (AddressHeap arch, M.Map (SymbolicInfo arch) (ConcreteAddress arch))
 allocateSymbolicBlockAddresses startAddr h0 blocksBySize = do
   isa <- askISA
   mem <- askMem
-  (_, _, m) <- F.foldlM (allocateBlockGroupAddresses isa mem) (startAddr, h0, M.empty) blocksBySize
-  return m
+  (_, h1, m) <- F.foldlM (allocateBlockGroupAddresses isa mem) (startAddr, h0, M.empty) blocksBySize
+  return (h1, m)
 
 -- | Allocate an address for the given symbolic block.
 --
