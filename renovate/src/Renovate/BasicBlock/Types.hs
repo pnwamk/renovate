@@ -28,6 +28,12 @@ import           Data.Maybe ( isNothing )
 import qualified Data.Text.Prettyprint.Doc as PD
 import           Data.Typeable ( Typeable )
 
+-- For pretty printing
+import qualified Lang.Crucible.CFG.Extension
+import qualified Data.Macaw.Symbolic.CrucGen
+import qualified Data.Macaw.CFG.Core
+import qualified Data.Macaw.CFG.AssignRhs
+
 import qualified Data.Macaw.CFG as MC
 
 import qualified SemMC.Architecture as SA
@@ -88,6 +94,12 @@ type InstructionConstraints arch =
   , Typeable (InstructionAnnotation arch)
   , Typeable (Instruction arch ())
   , MC.MemWidth (MC.ArchAddrWidth arch)
+
+  -- For pretty printing Crucible SSA CFGs
+  , Lang.Crucible.CFG.Extension.PrettyApp
+      (Data.Macaw.Symbolic.CrucGen.MacawArchStmtExtension arch)
+  , Data.Macaw.CFG.Core.PrettyF
+      (Data.Macaw.CFG.AssignRhs.ArchReg arch)
   )
 
 -- | The type of concrete 'BasicBlock's that have been assigned real
