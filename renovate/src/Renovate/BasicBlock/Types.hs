@@ -28,6 +28,8 @@ import           Data.Maybe ( isNothing )
 import qualified Data.Text.Prettyprint.Doc as PD
 import           Data.Typeable ( Typeable )
 
+import qualified Data.Parameterized.Classes as P
+
 -- For pretty printing
 import qualified Lang.Crucible.CFG.Extension
 import qualified Data.Macaw.Symbolic.CrucGen
@@ -93,7 +95,11 @@ type InstructionConstraints arch =
   , Typeable (Instruction arch)
   , Typeable (InstructionAnnotation arch)
   , Typeable (Instruction arch ())
+
   , MC.MemWidth (MC.ArchAddrWidth arch)
+  , P.TestEquality (MC.ArchReg arch)
+  , P.OrdF (MC.ArchReg arch)
+  , P.ShowF (MC.ArchReg arch)
 
   -- For pretty printing Crucible SSA CFGs
   , Lang.Crucible.CFG.Extension.PrettyApp
