@@ -1,4 +1,5 @@
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE LambdaCase #-}
 -- | This module is the entry point for binary code redirection
 module Renovate.Redirect (
   redirect,
@@ -114,11 +115,13 @@ redirect isa blockInfo (textStart, textEnd) instrumentor mem strat layoutAddr ba
              , disjoint isa (biOverlap blockInfo) cb
              ] of
      True ->  do
-       insns' <- lift $ instrumentor sb
-       case insns' of
-         Just insns'' -> RM.recordInstrumentedBytes blockSize
-                      >> return (SymbolicPair (LayoutPair cb sb { basicBlockInstructions = insns'' } Modified))
-         Nothing      -> return (SymbolicPair (LayoutPair cb sb Unmodified))
+       (lift $ instrumentor sb) >>= \case
+         Just insns' -> do
+           RM.recordInstrumentedBytes blockSize
+           let block' = isaReifyIndirectJump isa
+                        $ sb { basicBlockInstructions = insns' }
+           return (SymbolicPair (LayoutPair cb block' Modified))
+         Nothing -> return (SymbolicPair (LayoutPair cb sb Unmodified))
      False -> do
        when (not (isRelocatableTerminatorType (terminatorType isa mem cb))) $ do
          RM.recordUnrelocatableTermBlock

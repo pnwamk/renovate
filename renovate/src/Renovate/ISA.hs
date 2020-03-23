@@ -15,13 +15,20 @@ module Renovate.ISA
   ) where
 
 import Data.Word ( Word8, Word64 )
+import Data.Vector ( Vector )
 
 import           Data.Parameterized.Some
 import qualified Data.Macaw.CFG as MM
 import qualified Data.Macaw.Types as MT
 
 import Renovate.Address
-import Renovate.BasicBlock.Types ( ConcreteFallthrough, Instruction, InstructionAnnotation, RegisterType, TaggedInstruction )
+import Renovate.BasicBlock.Types ( ConcreteFallthrough
+                                 , Instruction
+                                 , InstructionAnnotation
+                                 , RegisterType
+                                 , TaggedInstruction
+                                 , SymbolicBlock
+                                 )
 
 -- | The variety of a jump: either conditional or unconditional.  This
 -- is used as a tag for 'JumpType's.  One day, we could model the type
@@ -97,6 +104,16 @@ data ISA arch = ISA
     -- has the worst case size behavior.
   , isaConcretizeAddresses :: MM.Memory (MM.ArchAddrWidth arch) -> ConcreteAddress arch -> Instruction arch (InstructionAnnotation arch) -> Instruction arch ()
     -- ^ Remove the annotation, with possible post-processing.
+
+  
+  , isaSymbolizeLookupTable :: MM.Memory (MM.ArchAddrWidth arch)
+                            -> (ConcreteAddress arch -> Maybe (SymbolicAddress arch))
+                            -> RegisterType arch
+                            -> Vector (SymbolicAddress arch)
+                            -> Instruction arch ()
+                            -> [TaggedInstruction arch (InstructionAnnotation arch)]
+  -- ^ TODO DESCRIBE
+  
   , isaJumpType :: forall t . Instruction arch t -> MM.Memory (MM.ArchAddrWidth arch) -> ConcreteAddress arch -> JumpType arch
     -- ^ Test if an instruction is a jump; if it is, return some
     -- metadata about the jump (destination or offset).
@@ -126,6 +143,8 @@ data ISA arch = ISA
     -- This function may change the size of the instruction, but should never
     -- make a bigger set of instructions than what it produces if the concrete
     -- addresses are 'isaMaxRelativeJumpSize' away.
+  , isaReifyIndirectJump :: SymbolicBlock arch -> SymbolicBlock arch
+  -- ^ Adjust indirect jumps (currently only certain jump tables).
   , isaMakePadding :: Word64 -> [Instruction arch ()]
     -- ^ Make the given number of bytes of padding instructions.
     -- The semantics of the instruction stream should either be

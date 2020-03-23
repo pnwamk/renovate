@@ -72,7 +72,7 @@ instance (PD.Pretty addr, PD.Pretty (i a)) => PD.Pretty (BasicBlock addr i a) wh
   pretty (BasicBlock insns addr _) =
     PD.pretty addr PD.<> ":" PD.<+> PD.align (PD.vsep (map PD.pretty insns))
 
-type instance ArchOf (BasicBlock addr instr retTy) = (ArchOf addr)
+type instance ArchOf (BasicBlock addr instr retTy) = ArchOf addr
 
 
 -- | The type of instructions for an architecture

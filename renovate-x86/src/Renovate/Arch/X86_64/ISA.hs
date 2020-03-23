@@ -13,6 +13,8 @@ import qualified GHC.Err.Located as L
 
 import qualified Control.Monad.Catch as C
 import           Data.Bits ( bit )
+import           Data.Vector ( Vector )
+import qualified Data.Vector as Vec
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy.Builder as B
 import qualified Data.ByteString.Lazy as LB
@@ -77,6 +79,7 @@ isa = R.ISA
   , R.isaStoreImmediate = x86StoreImmediate
   , R.isaAddImmediate = x86AddImmediate
   , R.isaSubtractImmediate = x86SubtractImmediate
+  , R.isaSymbolizeLookupTable = x64SymbolizeLookupTable
   }
 
 x86StackAddress :: R.StackAddress X86.X86_64 -> (Some MT.TypeRepr) -> Value
@@ -431,6 +434,33 @@ x64SymbolizeAddresses mem _lookup insnAddr mSymbolicTarget xi@(XI ii)
     jmpInstr = XI (jmpInstr0 { D.iiArgs = fmap (saveAbsoluteRipAddresses mem insnAddr xi) (D.iiArgs jmpInstr0) })
 
 
+
+x64SymbolizeLookupTable ::
+  MM.Memory 64
+  -> (R.ConcreteAddress arch -> Maybe (R.SymbolicAddress X86.X86_64))
+  -> R.RegisterType X86.X86_64
+  -> Vector (R.SymbolicAddress X86.X86_64)
+  -> Instruction ()
+  -> [R.TaggedInstruction X86.X86_64 TargetAddress]
+x64SymbolizeLookupTable mem addrLookup idx targets insn =
+  let n = Vec.length targets
+  in concat $
+     [ [ cmpIdx -- cmp i idx
+       , jeTgt -- je target[i]
+       ]
+     | i <- [0..n-2]
+     , let tgt = targets Vec.! i
+           cmpIdx =
+             R.tagInstruction Nothing
+             $ noAddr
+             $ makeInstr "cmp" [idx , D.QWordImm $ D.UImm64Concrete (fromIntegral i)]
+           jmpTgt = x64MakeSymbolicJumpOrCall "je" tgt
+           
+           
+     ] -- otherwise just jump to the final target
+     ++ [[x64MakeSymbolicJumpOrCall "jmp" (targets Vec.! (n-1))]]
+  
+  
 saveAbsoluteRipAddresses :: MM.Memory 64 -> R.ConcreteAddress X86.X86_64 -> Instruction () -> AnnotatedOperand () -> AnnotatedOperand TargetAddress
 saveAbsoluteRipAddresses mem insnAddr i AnnotatedOperand { aoOperand = (v, ty) } =
   AnnotatedOperand { aoOperand = (I.runIdentity (mapAddrRef promoteRipDisp8 I.Identity v), ty)

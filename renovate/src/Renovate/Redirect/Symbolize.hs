@@ -12,11 +12,16 @@ module Renovate.Redirect.Symbolize (
   ) where
 
 import qualified Data.Foldable as F
+import           Data.Parameterized.Some ( Some(..) )
+import qualified Data.Parameterized.Map as MapF
 import qualified Data.Macaw.CFG as MM
+import qualified Data.Macaw.Discovery as MC
 import qualified Data.Map as M
-import           Data.Maybe ( fromMaybe )
+import           Data.Maybe ( fromMaybe, mapMaybe, listToMaybe )
 import qualified Data.Traversable as T
 import           Data.Word ( Word64 )
+import           Data.Vector ( Vector )
+import qualified Data.Vector as Vec
 
 import           Prelude
 
@@ -101,9 +106,18 @@ symbolizeJumps isa mem symAddrMap (cb, symAddr) =
           let symTarget = lookupSymbolicAddress (addr `addressAddOffset` offset)
           in isaSymbolizeAddresses isa mem lookupSymAddr addr (Just symTarget) i
         IndirectJump _ ->
-          -- We do not know the destination of indirect jumps, so we
-          -- can't tag them (or rewrite them later)
-          isaSymbolizeAddresses isa mem lookupSymAddr addr Nothing i
+          -- If the indirect jump is known to be a lookup
+          -- into a jump table, rewrite that, otherwise We
+          -- do not know the destination of indirect jumps,
+          -- so we can't tag them (or rewrite them later)
+          case getParsedJumpTableTarget symAddrMap addr pblock of
+            Just (idx, tgts) ->
+              isaSymbolizeLookupTable isa mem lookupSymAddr idx tgts i
+            Nothing ->
+              error
+              $ "Renovate currently only handles indirect jumps"
+              ++ " which are known jump-table lookups, which the indirect jump"
+              ++ " found at "++show addr++" is not."
         DirectCall _ offset ->
           let symTarget = lookupSymbolicAddress (addr `addressAddOffset` offset)
           in isaSymbolizeAddresses isa mem lookupSymAddr addr (Just symTarget) i
@@ -112,6 +126,83 @@ symbolizeJumps isa mem symAddrMap (cb, symAddr) =
         NoJump -> isaSymbolizeAddresses isa mem lookupSymAddr addr Nothing i
 
     lookupSymbolicAddress target = fromMaybe (StableAddress target) (M.lookup target symAddrMap)
+
+-- | Given a ConcreteAddress and a ParsedBlock from Macaw,
+-- check if the given address is both the final instruction
+-- in the block and corresponds to a ParsedLookupTable that
+-- Macaw discovered, and if so return the reachable
+-- addresses.
+getParsedJumpTableTarget :: forall arch .
+  (InstructionConstraints arch, MM.MemWidth (MM.ArchAddrWidth arch))
+  => M.Map (ConcreteAddress arch) (SymbolicAddress arch)
+  -> ConcreteAddress arch
+  -> Maybe (Some (MC.ParsedBlock arch))
+  -> Maybe (RegisterType arch, Vector (SymbolicAddress arch))
+getParsedJumpTableTarget _symAddrMap _caddr Nothing = Nothing
+getParsedJumpTableTarget symAddrMap caddr (Just (Some b)) =
+  case (maybeLastStmtOffset, MC.pblockTermStmt b) of
+    (Nothing, _) ->
+      error $
+      "Renovate could not locate the last instruction"
+      ++ " in the Macaw ParsedBlock associated with address "
+      ++show caddr
+    ( Just offset
+      , (MC.ParsedLookupTable
+         regState -- (RegState (ArchReg arch) (Value arch ids))
+         idxAddr -- (ArchAddrValue arch ids)
+         tgtAddrs)) -- (V.Vector (ArchSegmentOff arch))
+     | Just caddr == concretizeMacawStmtAddr addr0 offset
+     , Just idx <- MapF.lookup idxAddr $ MM.regStateMap regState ->
+       let tgtCAddrs  = mapMaybe concretizeMacawAddr $ Vec.toList tgtAddrs
+       in if length tgtCAddrs == Vec.length tgtAddrs
+          then Just (idx, Vec.fromList $ map lookupSymAddr tgtCAddrs) -- TODO / FIXME / AMK
+          else error $
+               "Renovate could not calculate concrete addresses for all of the "
+               ++show (Vec.length tgtAddrs)
+               ++" jump table targets associated with "
+               ++show caddr
+               ++"\n Macaw Segment Offsets: "
+               ++show (Vec.toList tgtAddrs)
+               ++"\n Converted concrete addresses: "
+               ++show (map (concretizeMacawAddr @arch) $ Vec.toList tgtAddrs)
+
+    (_,_) -> Nothing
+  where -- | Block starting address
+        addr0 = MC.pblockAddr b
+        -- | The last statement offset (if one was found)
+        maybeLastStmtOffset = listToMaybe
+                              $ mapMaybe (\case
+                                             MM.InstructionStart a _ -> Just a
+                                             _ -> Nothing)
+                              $ reverse $ MC.pblockStmts b
+          -- | Convert a ConcreteAddress to a SymbolicAddress (if possible)
+        lookupSymAddr tgt = fromMaybe (StableAddress tgt) (M.lookup tgt symAddrMap)
+          -- | Register containing index for 
+
+-- TODO AMK double check this is correct
+concretizeMacawAddr :: forall arch .
+  (MM.MemWidth (MM.ArchAddrWidth arch))
+  => MM.MemSegmentOff (MM.ArchAddrWidth arch)
+  -> Maybe (ConcreteAddress arch)
+concretizeMacawAddr x = concreteFromAbsolute <$> mw
+  where mw :: Maybe (MM.MemWord (MM.ArchAddrWidth arch))
+        mw = MM.segoffAsAbsoluteAddr x
+
+-- TODO AMK double check this is correct
+concretizeMacawStmtAddr :: forall arch .
+  (MM.MemWidth (MM.ArchAddrWidth arch))
+  => MM.MemSegmentOff (MM.ArchAddrWidth arch)
+  -- ^ The containing block's start address.
+  -> MM.MemWord (MM.ArchAddrWidth arch)
+  -- ^ The statements offset from the block start.
+  -> Maybe (ConcreteAddress arch)
+concretizeMacawStmtAddr y0 yOffset = concreteFromAbsolute <$> MM.asAbsoluteAddr y
+  where y :: MM.MemAddr (MM.ArchAddrWidth arch)
+        y = MM.segmentOffAddr segment newOffset
+        segment :: MM.MemSegment (MM.ArchAddrWidth arch)
+        segment = MM.segoffSegment y0
+        newOffset :: MM.MemWord (MM.ArchAddrWidth arch)
+        newOffset = (MM.segoffOffset y0) + yOffset
 
 {- Note [Jump Promotion]
 
