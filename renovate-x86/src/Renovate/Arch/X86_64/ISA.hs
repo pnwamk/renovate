@@ -468,8 +468,7 @@ x64SymbolizeLookupJump R.SymbolicLookupTableInfo
                   $ noAddr
                   $ makeInstr
                   "cmp" [ D.QWordReg idxGpReg
-                        , D.QWordImm
-                          $ D.UImm64Concrete (fromIntegral i)
+                        , D.DWordSignedImm (fromIntegral i)
                         ]
                 jmpTgt = x64MakeSymbolicJumpOrCall "je" iTgt
           ] -- otherwise just jump to the final target
