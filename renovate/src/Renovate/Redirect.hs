@@ -32,12 +32,13 @@ import qualified Data.Foldable as F
 import qualified Data.List as L
 import           Data.Ord ( comparing )
 import qualified Data.Traversable as T
-
+import           Data.Parameterized.Some
 
 import           Prelude
 
 import qualified Data.Macaw.CFG as MM
 import qualified Data.Macaw.CFG as MC
+import qualified Data.Macaw.Discovery.State as MDS
 
 
 import           Renovate.Address
@@ -110,7 +111,7 @@ redirect isa blockInfo (textStart, textEnd) instrumentor mem strat layoutAddr ba
     -- Also, see Note [PIC Jump Tables]
     case and [ textStart <= basicBlockAddress cb
              , basicBlockAddress cb < textEnd
-             , isRelocatableTerminatorType (terminatorType isa mem cb)
+             , hasRelocatableTerminatorType isa mem cb
              , not (isIncompleteBlockAddress blockInfo (basicBlockAddress cb))
              , disjoint isa (biOverlap blockInfo) cb
              ] of
@@ -122,7 +123,7 @@ redirect isa blockInfo (textStart, textEnd) instrumentor mem strat layoutAddr ba
            return (SymbolicPair (LayoutPair cb block' Modified))
          Nothing -> return (SymbolicPair (LayoutPair cb sb Unmodified))
      False -> do
-       when (not (isRelocatableTerminatorType (terminatorType isa mem cb))) $ do
+       when (not (hasRelocatableTerminatorType isa mem cb)) $ do
          RM.recordUnrelocatableTermBlock
        when (isIncompleteBlockAddress blockInfo (basicBlockAddress cb)) $ do
          RM.recordIncompleteBlock
@@ -148,6 +149,18 @@ toBlockMapping ps =
   [ (basicBlockAddress (lpOrig lp), basicBlockAddress (lpNew lp))
   | ConcretePair lp <- ps
   ]
+
+hasRelocatableTerminatorType ::
+  (MC.ArchConstraints arch)
+  => ISA arch
+  -> MC.Memory (MC.ArchAddrWidth arch)
+  -> ConcreteBlock arch
+  -> Bool
+hasRelocatableTerminatorType isa mem cb
+  | isRelocatableTerminatorType (terminatorType isa mem cb) = True
+  | Just (Some parsedBlock) <- basicParsedBlock cb
+  , MDS.ParsedLookupTable{} <- MDS.pblockTermStmt parsedBlock = True
+  | otherwise = False
 
 isRelocatableTerminatorType :: JumpType arch -> Bool
 isRelocatableTerminatorType jt =
