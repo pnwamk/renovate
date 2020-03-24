@@ -77,6 +77,7 @@ module Renovate
   A.concreteFromAbsolute,
   A.addressAddOffset,
   A.addressDiff,
+  A.SymbolicLookupTableInfo(..),
   -- * Analysis
   -- ** Function Recovery
   FR.recoverFunctions,

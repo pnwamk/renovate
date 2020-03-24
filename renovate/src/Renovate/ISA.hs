@@ -15,7 +15,6 @@ module Renovate.ISA
   ) where
 
 import Data.Word ( Word8, Word64 )
-import Data.Vector ( Vector )
 
 import           Data.Parameterized.Some
 import qualified Data.Macaw.CFG as MM
@@ -27,7 +26,6 @@ import Renovate.BasicBlock.Types ( ConcreteFallthrough
                                  , InstructionAnnotation
                                  , RegisterType
                                  , TaggedInstruction
-                                 , SymbolicBlock
                                  )
 
 -- | The variety of a jump: either conditional or unconditional.  This
@@ -106,12 +104,9 @@ data ISA arch = ISA
     -- ^ Remove the annotation, with possible post-processing.
 
   
-  , isaSymbolizeLookupTable :: MM.Memory (MM.ArchAddrWidth arch)
-                            -> (ConcreteAddress arch -> Maybe (SymbolicAddress arch))
-                            -> RegisterType arch
-                            -> Vector (SymbolicAddress arch)
-                            -> Instruction arch ()
-                            -> [TaggedInstruction arch (InstructionAnnotation arch)]
+  , isaSymbolizeLookupJump ::
+      SymbolicLookupTableInfo arch
+      -> Maybe [TaggedInstruction arch (InstructionAnnotation arch)]
   -- ^ TODO DESCRIBE
   
   , isaJumpType :: forall t . Instruction arch t -> MM.Memory (MM.ArchAddrWidth arch) -> ConcreteAddress arch -> JumpType arch
@@ -143,8 +138,6 @@ data ISA arch = ISA
     -- This function may change the size of the instruction, but should never
     -- make a bigger set of instructions than what it produces if the concrete
     -- addresses are 'isaMaxRelativeJumpSize' away.
-  , isaReifyIndirectJump :: SymbolicBlock arch -> SymbolicBlock arch
-  -- ^ Adjust indirect jumps (currently only certain jump tables).
   , isaMakePadding :: Word64 -> [Instruction arch ()]
     -- ^ Make the given number of bytes of padding instructions.
     -- The semantics of the instruction stream should either be

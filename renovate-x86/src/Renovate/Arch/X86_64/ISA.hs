@@ -2,6 +2,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 -- | The 'ISA' for x86_64
 module Renovate.Arch.X86_64.ISA (
   isa,
@@ -13,7 +14,6 @@ import qualified GHC.Err.Located as L
 
 import qualified Control.Monad.Catch as C
 import           Data.Bits ( bit )
-import           Data.Vector ( Vector )
 import qualified Data.Vector as Vec
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy.Builder as B
@@ -24,10 +24,15 @@ import           Data.List ( genericReplicate )
 import           Data.Maybe
 import           Data.Parameterized.Some
 import           Data.Parameterized.NatRepr
+import           Data.Parameterized.Classes ( testEquality )
+import           Data.Parameterized.Pair ( Pair(..) )
+import qualified Data.Parameterized.Map as MapF
+
 import qualified Data.Text.Prettyprint.Doc as PD
 import           Data.Word ( Word8, Word64 )
 
 import qualified Data.Macaw.Memory as MM
+import qualified Data.Macaw.CFG as MC
 import qualified Data.Macaw.Types as MT
 import qualified Data.Macaw.X86 as X86
 import qualified Flexdis86 as D
@@ -79,8 +84,8 @@ isa = R.ISA
   , R.isaStoreImmediate = x86StoreImmediate
   , R.isaAddImmediate = x86AddImmediate
   , R.isaSubtractImmediate = x86SubtractImmediate
-  , R.isaSymbolizeLookupTable = x64SymbolizeLookupTable
-  }
+  , R.isaSymbolizeLookupJump = x64SymbolizeLookupJump
+  } 
 
 x86StackAddress :: R.StackAddress X86.X86_64 -> (Some MT.TypeRepr) -> Value
 x86StackAddress addr (Some tp) = do
@@ -435,31 +440,41 @@ x64SymbolizeAddresses mem _lookup insnAddr mSymbolicTarget xi@(XI ii)
 
 
 
-x64SymbolizeLookupTable ::
-  MM.Memory 64
-  -> (R.ConcreteAddress arch -> Maybe (R.SymbolicAddress X86.X86_64))
-  -> R.RegisterType X86.X86_64
-  -> Vector (R.SymbolicAddress X86.X86_64)
-  -> Instruction ()
-  -> [R.TaggedInstruction X86.X86_64 TargetAddress]
-x64SymbolizeLookupTable mem addrLookup idx targets insn =
-  let n = Vec.length targets
-  in concat $
-     [ [ cmpIdx -- cmp i idx
-       , jeTgt -- je target[i]
-       ]
-     | i <- [0..n-2]
-     , let tgt = targets Vec.! i
-           cmpIdx =
-             R.tagInstruction Nothing
-             $ noAddr
-             $ makeInstr "cmp" [idx , D.QWordImm $ D.UImm64Concrete (fromIntegral i)]
-           jmpTgt = x64MakeSymbolicJumpOrCall "je" tgt
-           
-           
-     ] -- otherwise just jump to the final target
-     ++ [[x64MakeSymbolicJumpOrCall "jmp" (targets Vec.! (n-1))]]
-  
+x64SymbolizeLookupJump ::
+  R.SymbolicLookupTableInfo X86.X86_64
+  -> Maybe [R.TaggedInstruction X86.X86_64 TargetAddress]
+x64SymbolizeLookupJump R.SymbolicLookupTableInfo
+  { R.symbolicLookupRegs = regState
+  , R.symbolicLookupIdx = rawIdx
+  , R.symbolicLookupAddrs = tgts
+  } =
+  case mapMaybe computeJumpInsns regs of
+    [insns] -> Just insns
+    _ -> Nothing
+  where
+    regs = MapF.toList $ MC.regStateMap regState
+    n =  Vec.length tgts
+    computeJumpInsns (Pair idxReg v)
+      | Just Refl <- testEquality v rawIdx
+      , X86.X86_GP idxGpReg <- idxReg =
+          Just $ concat $
+          [ [ cmpIdx -- cmp i idx
+            , jmpTgt -- je target[i]
+            ]
+          | i <- [0..n-2]
+          , let iTgt = tgts Vec.! i
+                cmpIdx =
+                  R.tagInstruction Nothing
+                  $ noAddr
+                  $ makeInstr
+                  "cmp" [ D.QWordReg idxGpReg
+                        , D.QWordImm
+                          $ D.UImm64Concrete (fromIntegral i)
+                        ]
+                jmpTgt = x64MakeSymbolicJumpOrCall "je" iTgt
+          ] -- otherwise just jump to the final target
+          ++ [[x64MakeSymbolicJumpOrCall "jmp" (tgts Vec.! (n-1))]]
+      | otherwise = Nothing
   
 saveAbsoluteRipAddresses :: MM.Memory 64 -> R.ConcreteAddress X86.X86_64 -> Instruction () -> AnnotatedOperand () -> AnnotatedOperand TargetAddress
 saveAbsoluteRipAddresses mem insnAddr i AnnotatedOperand { aoOperand = (v, ty) } =

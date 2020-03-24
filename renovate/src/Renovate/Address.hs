@@ -4,6 +4,7 @@
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE ExistentialQuantification #-}
 -- | This module defines opaque concrete and symbolic address types.
 module Renovate.Address (
   ArchOf,
@@ -14,13 +15,15 @@ module Renovate.Address (
   concreteAsSegmentOff,
   absoluteAddress,
   addressAddOffset,
-  addressDiff
+  addressDiff,
+  SymbolicLookupTableInfo(..)
   ) where
 
 import qualified GHC.Err.Located as L
 
 import qualified Data.Text.Prettyprint.Doc as PD
 import           Data.Word ( Word64 )
+import           Data.Vector ( Vector )
 import qualified Numeric as N
 
 import qualified Data.Macaw.Memory as MM
@@ -135,3 +138,14 @@ addressDiff :: (MM.MemWidth (MM.ArchAddrWidth arch)) => ConcreteAddress arch -> 
 addressDiff (ConcreteAddress memAddr1) (ConcreteAddress memAddr2) = diff
   where
     Just diff = MM.diffAddr memAddr1 memAddr2
+
+
+-- | Stores the jump-table lookup info found in Macaw's
+-- @ParsedLookupTable@ so we can unpack in each backend and
+-- rewrite the jumps.
+data SymbolicLookupTableInfo arch =
+  forall ids . SymbolicLookupTableInfo
+  { symbolicLookupRegs :: MM.RegState (MM.ArchReg arch) (MM.Value arch ids)
+  , symbolicLookupIdx :: MM.ArchAddrValue arch ids
+  , symbolicLookupAddrs :: Vector (SymbolicAddress arch)
+  }

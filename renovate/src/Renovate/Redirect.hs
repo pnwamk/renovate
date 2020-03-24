@@ -118,8 +118,7 @@ redirect isa blockInfo (textStart, textEnd) instrumentor mem strat layoutAddr ba
        (lift $ instrumentor sb) >>= \case
          Just insns' -> do
            RM.recordInstrumentedBytes blockSize
-           let block' = isaReifyIndirectJump isa
-                        $ sb { basicBlockInstructions = insns' }
+           let block' = sb { basicBlockInstructions = insns' }
            return (SymbolicPair (LayoutPair cb block' Modified))
          Nothing -> return (SymbolicPair (LayoutPair cb sb Unmodified))
      False -> do
